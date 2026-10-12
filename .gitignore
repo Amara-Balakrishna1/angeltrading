@@ -1,0 +1,51 @@
+
+.pypirc
+*.xml
+.idea/
+build/*
+smartapi_python.egg-info
+dist/*
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# Data files (large CSVs, logs)
+data/
+logs/
+
+# Cache files (backtest)
+backtest/cache_*/
+backtest/cache_3leg/
+
+# Large API data
+live/OpenAPIScripMaster.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+*.png
+
+# Credentials / secrets
+config.py
+test_credentials.py
+*.pem
+*.key
+credentials.json
+
+# Gemini / Agent files
+.gemini/
+.agents/
