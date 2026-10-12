@@ -1,213 +1,278 @@
-# SMARTAPI-PYTHON
+# Angel Trading — Automated Options Strategies
 
-SMARTAPI-PYTHON is a Python library for interacting with Angel's Trading platform  ,that is a set of REST-like HTTP APIs that expose many capabilities required to build stock market investment and trading platforms. It lets you execute orders in real time..
+A Python-based automated trading system built on **Angel One SmartAPI** for executing options strategies on Indian indices (NIFTY, SENSEX, BANKNIFTY).
 
+## 📋 Table of Contents
+
+- [Features](#features)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Strategies](#strategies)
+  - [Day Breakout Strategy](#1-day-breakout-strategy-live)
+  - [Three Legs Strategy](#2-three-legs-strategy-live)
+  - [Breakout Viewer](#3-breakout-viewer)
+- [Backtesting](#backtesting)
+- [Tests](#tests)
+- [Project Structure](#project-structure)
+
+---
+
+## Features
+
+- **Day Breakout Strategy** — Trades NIFTY/SENSEX based on previous-day range breakouts with 15-minute candle confirmation
+- **Three Legs Strategy** — BANKNIFTY multi-leg hedged options strategy
+- **Breakout Viewer** — Visual monitoring tool for breakout levels
+- **Backtesting** — Historical backtesting with same rules as live trading
+- **Risk Management** — Stop-loss, trailing profit, daily loss limits, cooldowns, and broker-side SL orders
+- **Gap Analysis** — Overnight gap detection with adaptive entry rules
+- **VIX Filters** — India VIX-based entry delays and reversal suppression
+
+---
+
+## Prerequisites
+
+1. **Python 3.8+** installed on your machine
+2. **Angel One Trading Account** with SmartAPI enabled
+3. **Angel One SmartAPI Credentials**:
+   - API Key (from [SmartAPI Dashboard](https://smartapi.angelbroking.com/))
+   - Client Code (your Angel One login ID)
+   - PIN (your trading password)
+   - TOTP Secret Key (QR code value for 2FA)
+
+---
 
 ## Installation
 
-Use the package manager [pip](https://pip.pypa.io/en/stable/) to install smartapi-python.
+### 1. Clone the Repository
 
 ```bash
-pip install -r requirements_dev.txt       # for downloading the other required packages
+git clone https://github.com/Amara-Balakrishna1/angeltrading.git
+cd angeltrading
 ```
 
-Download the following packages
+### 2. Create a Virtual Environment
+
 ```bash
-pip install pyotp
-pip install logzero
-pip install websocket-client    
-```
-For Downloading pycryptodome package
-```bash
-pip uninstall pycrypto
-pip install pycryptodome    
+# Windows
+python -m venv .venv
+.venv\Scripts\activate
+
+# Linux/Mac
+python3 -m venv .venv
+source .venv/bin/activate
 ```
 
-## Usage
+### 3. Install Dependencies
+
+```bash
+pip install -r requirements_dev.txt
+pip install pyotp logzero websocket-client
+pip uninstall pycrypto -y        # Remove old pycrypto if present
+pip install pycryptodome
+```
+
+---
+
+## Configuration
+
+### Create `config.py` in the project root
+
+This file is **git-ignored** (it contains your secrets). Create it manually:
 
 ```python
-# package import statement
-from SmartApi import SmartConnect #or from SmartApi.smartConnect import SmartConnect
-import pyotp
-from logzero import logger
+# config.py (in project root — DO NOT commit this file)
 
-api_key = 'Your Api Key'
-username = 'Your client code'
-pwd = 'Your pin'
-smartApi = SmartConnect(api_key)
-try:
-    token = "Your QR value"
-    totp = pyotp.TOTP(token).now()
-except Exception as e:
-    logger.error("Invalid Token: The provided token is not valid.")
-    raise e
+api_key = 'YOUR_SMARTAPI_API_KEY'       # From SmartAPI dashboard
+username = 'YOUR_CLIENT_CODE'           # Angel One login ID (e.g., 'A12345678')
+pwd = 'YOUR_PIN'                        # Your trading PIN
+token = 'YOUR_TOTP_SECRET_KEY'          # QR secret for TOTP 2FA
 
-correlation_id = "abcde"
-data = smartApi.generateSession(username, pwd, totp)
-
-if data['status'] == False:
-    logger.error(data)
-    
-else:
-    # login api call
-    # logger.info(f"You Credentials: {data}")
-    authToken = data['data']['jwtToken']
-    refreshToken = data['data']['refreshToken']
-    # fetch the feedtoken
-    feedToken = smartApi.getfeedToken()
-    # fetch User Profile
-    res = smartApi.getProfile(refreshToken)
-    smartApi.generateToken(refreshToken)
-    res=res['data']['exchanges']
-
-    #place order
-    try:
-        orderparams = {
-            "variety": "NORMAL",
-            "tradingsymbol": "SBIN-EQ",
-            "symboltoken": "3045",
-            "transactiontype": "BUY",
-            "exchange": "NSE",
-            "ordertype": "LIMIT",
-            "producttype": "INTRADAY",
-            "duration": "DAY",
-            "price": "19500",
-            "squareoff": "0",
-            "stoploss": "0",
-            "quantity": "1"
-            }
-        # Method 1: Place an order and return the order ID
-        orderid = smartApi.placeOrder(orderparams)
-        logger.info(f"PlaceOrder : {orderid}")
-        # Method 2: Place an order and return the full response
-        response = smartApi.placeOrderFullResponse(orderparams)
-        logger.info(f"PlaceOrder : {response}")
-    except Exception as e:
-        logger.exception(f"Order placement failed: {e}")
-
-    #gtt rule creation
-    try:
-        gttCreateParams={
-                "tradingsymbol" : "SBIN-EQ",
-                "symboltoken" : "3045",
-                "exchange" : "NSE", 
-                "producttype" : "MARGIN",
-                "transactiontype" : "BUY",
-                "price" : 100000,
-                "qty" : 10,
-                "disclosedqty": 10,
-                "triggerprice" : 200000,
-                "timeperiod" : 365
-            }
-        rule_id=smartApi.gttCreateRule(gttCreateParams)
-        logger.info(f"The GTT rule id is: {rule_id}")
-    except Exception as e:
-        logger.exception(f"GTT Rule creation failed: {e}")
-        
-    #gtt rule list
-    try:
-        status=["FORALL"] #should be a list
-        page=1
-        count=10
-        lists=smartApi.gttLists(status,page,count)
-    except Exception as e:
-        logger.exception(f"GTT Rule List failed: {e}")
-
-    #Historic api
-    try:
-        historicParam={
-        "exchange": "NSE",
-        "symboltoken": "3045",
-        "interval": "ONE_MINUTE",
-        "fromdate": "2021-02-08 09:00", 
-        "todate": "2021-02-08 09:16"
-        }
-        smartApi.getCandleData(historicParam)
-    except Exception as e:
-        logger.exception(f"Historic Api failed: {e}")
-    #logout
-    try:
-        logout=smartApi.terminateSession('Your Client Id')
-        logger.info("Logout Successfull")
-    except Exception as e:
-        logger.exception(f"Logout failed: {e}")
-
-    ```
-
-    ## Getting started with SmartAPI Websocket's
-    ####### Websocket V2 sample code #######
-
-    from SmartApi.smartWebSocketV2 import SmartWebSocketV2
-    from logzero import logger
-
-    AUTH_TOKEN = "authToken"
-    API_KEY = "api_key"
-    CLIENT_CODE = "client code"
-    FEED_TOKEN = "feedToken"
-    correlation_id = "abc123"
-    action = 1
-    mode = 1
-
-    token_list = [
-        {
-            "exchangeType": 1,
-            "tokens": ["26009"]
-        }
-    ]
-    token_list1 = [
-        {
-            "action": 0,
-            "exchangeType": 1,
-            "tokens": ["26009"]
-        }
-    ]
-
-    sws = SmartWebSocketV2(AUTH_TOKEN, API_KEY, CLIENT_CODE, FEED_TOKEN)
-
-    def on_data(wsapp, message):
-        logger.info("Ticks: {}".format(message))
-        # close_connection()
-
-    def on_open(wsapp):
-        logger.info("on open")
-        sws.subscribe(correlation_id, mode, token_list)
-        # sws.unsubscribe(correlation_id, mode, token_list1)
-
-
-    def on_error(wsapp, error):
-        logger.error(error)
-
-
-    def on_close(wsapp):
-        logger.info("Close")
-
-
-
-    def close_connection():
-        sws.close_connection()
-
-
-    # Assign the callbacks.
-    sws.on_open = on_open
-    sws.on_data = on_data
-    sws.on_error = on_error
-    sws.on_close = on_close
-
-    sws.connect()
-    ####### Websocket V2 sample code ENDS Here #######
-
-    ########################### SmartWebSocket OrderUpdate Sample Code Start Here ###########################
-    from SmartApi.smartWebSocketOrderUpdate import SmartWebSocketOrderUpdate
-    client = SmartWebSocketOrderUpdate(AUTH_TOKEN, API_KEY, CLIENT_CODE, FEED_TOKEN)
-    client.connect()
-    ########################### SmartWebSocket OrderUpdate Sample Code End Here ###########################
+# Set to True if you face SSL certificate errors (e.g., corporate network)
+disable_ssl = False
 ```
-##Change-log
-##1.4.5
-- Upgraded TLS Version
 
-##1.4.7
-- Added Error log file
+#### How to get these credentials:
 
-##1.4.8
-- Intgrated EDIS, Brokerage Calculator, Option Greek, TopGainersLosers, PutRatio API
+| Credential | Where to find it |
+|---|---|
+| `api_key` | [SmartAPI Dashboard](https://smartapi.angelbroking.com/) → Create an App → Copy the API Key |
+| `username` | Your Angel One **Client Code** (login ID, starts with a letter followed by numbers) |
+| `pwd` | Your **PIN** used to log in to Angel One |
+| `token` | When enabling TOTP on Angel One, you get a **QR code** — the secret key behind it goes here. You can also use the manual setup key shown during TOTP setup. |
+
+> ⚠️ **Security**: Never commit `config.py` to git. The `.gitignore` already excludes it.
+
+---
+
+## Strategies
+
+### 1. Day Breakout Strategy (Live)
+
+Trades NIFTY or SENSEX options based on the **previous day's 12:30 PM – 3:15 PM range**. When the current day's 15-minute candle closes beyond that range, it enters a Bull Call Spread or Bear Put Spread (or naked option).
+
+**Run from the project root:**
+
+```bash
+# Interactive mode (prompts for instrument & structure)
+python live/daybreakout/main.py
+
+# Direct CLI — NIFTY, paper trading (no real orders)
+python live/daybreakout/main.py --instrument NIFTY --lots 10 --paper
+
+# SENSEX, live trading, naked options
+python live/daybreakout/main.py --instrument SENSEX --lots 5 --structure naked
+
+# Follow breakouts instead of fading them (default is reverse/fade)
+python live/daybreakout/main.py --instrument NIFTY --no-reverse
+
+# Manual range levels
+python live/daybreakout/main.py --instrument NIFTY --high 23550 --low 23350
+
+# Auto-pick nearest expiry between NIFTY and SENSEX
+python live/daybreakout/main.py --combination true
+```
+
+#### CLI Arguments
+
+| Argument | Default | Description |
+|---|---|---|
+| `--instrument`, `-i` | prompt | `NIFTY` or `SENSEX` |
+| `--structure`, `-s` | prompt | `spread` (2-leg) or `naked` (1-leg) |
+| `--lots`, `-l` | `10` | Number of lots |
+| `--high` | auto | Manual override for Range High |
+| `--low` | auto | Manual override for Range Low |
+| `--date` | auto | Previous trading day (`YYYY-MM-DD`) |
+| `--paper` | off | Paper trading mode — no real orders |
+| `--reverse` / `--no-reverse` | reverse ON | Fade breakouts (default) or follow them |
+| `--combination` | `false` | Auto-pick nearest expiry instrument |
+| `--tick-confirm` | off | Legacy 5-min LTP hold instead of 15m candle |
+
+> 📖 For full strategy details, see [`live/daybreakout/README.md`](live/daybreakout/README.md)
+
+---
+
+### 2. Three Legs Strategy (Live)
+
+A multi-leg hedged options strategy for **BANKNIFTY** with automatic spread adjustments based on P&L thresholds.
+
+```bash
+python live/threelegs/main.py
+```
+
+**Key settings** (in `live/threelegs/config.py`):
+- Spread 1: ATM ± 1000 points
+- Spread 2: ATM ± 2500 points
+- Loss threshold for adjustment: Rs. 2,000
+- Hard stop-loss: Rs. 10,000
+- Entry: 09:30 | Exit: 15:10
+
+---
+
+### 3. Breakout Viewer
+
+Visual monitoring tool for tracking breakout levels in real-time.
+
+```bash
+python live/breakoutstrategy/viewer.py
+```
+
+---
+
+## Backtesting
+
+Run historical backtests using the **same rules** as the live strategy:
+
+```bash
+# NIFTY backtest with spread structure
+python backtest/backtest_daybreakout.py --instrument NIFTY
+
+# SENSEX backtest with naked options
+python backtest/backtest_daybreakout.py --instrument SENSEX --structure naked
+```
+
+**Output**: Trade-by-trade breakdown + CSV at `data/backtest_daybreakout_15m_<INSTRUMENT>_<STRUCTURE>.csv`
+
+**Backtest arguments**: `--instrument/-i`, `--structure/-s`, `--days/-d`, `--lots/-l`, `--reverse`/`--no-reverse`
+
+> ⚠️ Note: `days_back=35` and `lots=10` are currently hardcoded in `main()`. Edit those lines if you need different values.
+
+---
+
+## Tests
+
+```bash
+# Day Breakout unit tests
+python -m unittest test.test_daybreakout -v
+
+# Thread safety tests
+python -m unittest test.test_thread_safety_breakout -v
+```
+
+---
+
+## Project Structure
+
+```
+angeltrading/
+├── config.py                  # ⚠️ YOUR CREDENTIALS (create manually, git-ignored)
+├── requirements_dev.txt       # Python dependencies
+├── setup.py                   # Package setup
+├── SmartApi/                  # Angel One SmartAPI client library
+│   ├── smartConnect.py        # REST API client
+│   ├── smartWebSocketV2.py    # WebSocket client
+│   └── ...
+├── live/                      # Live trading strategies
+│   ├── daybreakout/           # Day Breakout Strategy
+│   │   ├── main.py            # Entry point / launcher
+│   │   ├── strategy.py        # Core strategy logic
+│   │   ├── executor.py        # Order execution & API calls
+│   │   ├── config.py          # Strategy configuration
+│   │   ├── signals.py         # Signal detection
+│   │   ├── gap_analyzer.py    # Overnight gap analysis
+│   │   ├── contract_finder.py # Option contract lookup
+│   │   ├── range_calculator.py# Previous day range calculation
+│   │   ├── thread_safety.py   # Thread synchronization
+│   │   └── README.md          # Detailed strategy documentation
+│   ├── threelegs/             # Three Legs Strategy
+│   │   ├── main.py            # Entry point
+│   │   ├── strategy.py        # Strategy logic
+│   │   ├── executor.py        # Order execution
+│   │   └── config.py          # Configuration
+│   └── breakoutstrategy/      # Breakout Viewer
+│       ├── viewer.py          # Visual monitoring
+│       └── breakout.py        # Breakout logic
+├── backtest/                  # Backtesting tools
+│   ├── backtest_daybreakout.py# Day Breakout backtest
+│   ├── backtest_utils.py      # Shared utilities
+│   └── ...
+├── test/                      # Unit tests
+├── data/                      # Trade logs, CSVs (git-ignored)
+└── example/                   # SmartAPI usage examples
+```
+
+---
+
+## ⚡ Quick Start (TL;DR)
+
+```bash
+# 1. Clone & setup
+git clone https://github.com/Amara-Balakrishna1/angeltrading.git
+cd angeltrading
+python -m venv .venv && .venv\Scripts\activate
+pip install -r requirements_dev.txt
+
+# 2. Create config.py with your Angel One credentials (see Configuration section above)
+
+# 3. Test with paper trading first!
+python live/daybreakout/main.py --instrument NIFTY --paper
+
+# 4. When ready, go live
+python live/daybreakout/main.py --instrument NIFTY --lots 10
+```
+
+---
+
+## ⚠️ Disclaimer
+
+This software is for **educational purposes only**. Trading in the stock market involves substantial risk of loss. The authors are not responsible for any financial losses incurred through the use of this software. Always test with paper trading before using real money.
