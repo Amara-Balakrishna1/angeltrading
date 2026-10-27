@@ -64,6 +64,7 @@ def evaluate_15m_close(
     extra_candles_wait: Optional[int] = None,
     last_entry_hhmm: Optional[str] = None,
     first_entry_hhmm: Optional[str] = None,
+    no_chase_cutoff_hhmm: Optional[str] = None,
 ) -> CandleSignal:
     """
     Evaluate one completed 15-minute candle the same way the backtest does.
@@ -74,6 +75,10 @@ def evaluate_15m_close(
         Candle start as HH:MM (e.g. "09:15").
     candle_index : int
         0-based index of this candle in today's 15-minute series.
+    no_chase_cutoff_hhmm : str, optional
+        Once the candle time is at/after this HH:MM, the no-chase opening-candle
+        skip is suppressed. Lets a late session start confirm a with-gap breakout
+        immediately instead of waiting out the opening no-chase window.
     """
     if extra_candles_wait is None:
         extra_candles_wait = extra_15m_candles_wait()
@@ -81,6 +86,11 @@ def evaluate_15m_close(
         last_entry_hhmm = BREAKOUT_CONFIG["last_entry_hhmm"]
     if first_entry_hhmm is None:
         first_entry_hhmm = BREAKOUT_CONFIG.get("first_entry_hhmm", "09:30")
+    if no_chase_cutoff_hhmm is None:
+        no_chase_cutoff_hhmm = GAP_CONFIG.get("no_chase_cutoff_hhmm")
+    past_no_chase_cutoff = (
+        no_chase_cutoff_hhmm is not None and c_time >= no_chase_cutoff_hhmm
+    )
 
     touched = update_gap_territory(c_close, range_high, range_low, gap_info, gap_territory_touched)
 
@@ -132,6 +142,7 @@ def evaluate_15m_close(
         and gap_info.no_chase_same_direction
         and same_gap_direction
         and candle_index < extra_candles_wait
+        and not past_no_chase_cutoff
     )
     if no_chase_skip:
         return CandleSignal(

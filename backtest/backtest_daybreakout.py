@@ -53,12 +53,27 @@ if VENV_SITE_PACKAGES.exists() and str(VENV_SITE_PACKAGES) not in sys.path:
     sys.path.insert(0, str(VENV_SITE_PACKAGES))
 
 import csv
+import json
 import pyotp
 from SmartApi.smartConnect import SmartConnect
 import config
 from live.daybreakout.config import INSTRUMENTS, RISK_CONFIG, GAP_CONFIG, DATA_DIR, VIX_CONFIG, BREAKOUT_CONFIG
 from live.daybreakout.gap_analyzer import classify_gap, GapInfo
 from live.daybreakout.signals import apply_reverse, evaluate_15m_close, extra_15m_candles_wait
+from live.daybreakout.contract_finder import load_scrip_master, find_option_contract
+
+
+def candle_end_datetime(timestamp: str) -> datetime:
+    """Return the close time of a 15-minute candle from its start timestamp."""
+    normalized = str(timestamp).replace("T", " ").split("+")[0].split("Z")[0].strip()
+    if len(normalized) == 16:
+        normalized += ":00"
+    return datetime.strptime(normalized[:19], "%Y-%m-%d %H:%M:%S") + timedelta(minutes=15)
+
+
+def candle_end_hhmm(timestamp: str) -> str:
+    """Return the 15-minute candle close time as HH:MM for trade reporting."""
+    return candle_end_datetime(timestamp).strftime("%H:%M")
 
 
 # ============================================================
@@ -92,11 +107,20 @@ def get_option_premium(
     direction: str,
     days_to_expiry: float = 4.0,
     sigma: float = 0.14,
-    structure: str = "spread"
+    structure: str = "spread",
+    time_to_expiry_years: Optional[float] = None
 ) -> float:
     """Calculates model option premium for 2-leg spread or 1-leg naked option.
-    days_to_expiry: Days to expiry (will be converted to fraction of year internally)"""
-    T = max(0.001, days_to_expiry / 365.0)
+
+    time_to_expiry_years: Exact time to expiry in years (preferred). When
+        supplied it is used directly so intraday time decay is modelled.
+    days_to_expiry: Fallback calendar days to expiry (converted to years).
+    """
+    if time_to_expiry_years is not None:
+        # One-minute floor keeps Black-Scholes well-defined on expiry day.
+        T = max(time_to_expiry_years, 1.0 / (365.0 * 24.0 * 60.0))
+    else:
+        T = max(0.001, days_to_expiry / 365.0)
     is_bullish = direction.upper() in ("BULLISH", "BUY_CALL_SPREAD", "CE")
     is_naked = structure.lower() == "naked" or sell_strike is None
 
@@ -160,6 +184,79 @@ def calculate_days_to_expiry(current_date: str, instrument: str = "NIFTY") -> fl
     # For intraday trading, we typically trade weekly options
     # Return days (will be converted to fraction of year in get_option_premium)
     return max(0.01, days_to_expiry)
+
+
+def expiry_weekday_for(instrument: str) -> int:
+    """Weekly expiry weekday (Mon=0 ... Sun=6) for the instrument."""
+    instr_upper = instrument.upper()
+    if instr_upper in ("NIFTY", "BANKNIFTY"):
+        return 1  # Tuesday
+    if instr_upper == "SENSEX":
+        return 3  # Thursday
+    return 3  # Default to Thursday
+
+
+def nearest_expiry_datetime(ref_dt: datetime, instrument: str) -> datetime:
+    """Returns the next weekly expiry at 15:30 on/after ref_dt."""
+    expiry_weekday = expiry_weekday_for(instrument)
+    days_ahead = (expiry_weekday - ref_dt.weekday()) % 7
+    expiry_date = (ref_dt + timedelta(days=days_ahead)).date()
+    expiry_dt = datetime.combine(expiry_date, datetime.min.time()).replace(
+        hour=15, minute=30
+    )
+    if expiry_dt <= ref_dt:
+        expiry_dt += timedelta(days=7)
+    return expiry_dt
+
+
+def time_to_expiry_years(
+    curr_date: str,
+    hhmm: str,
+    instrument: str,
+    expiry_date: Optional[Any] = None,
+) -> float:
+    """Exact time to expiry (in years) from a date/time until 15:30 on expiry day.
+
+    expiry_date: Optional real expiry date (from the scrip master). When given
+        it correctly handles holiday-shifted expiries; otherwise the weekly
+        weekday heuristic is used.
+    """
+    ref_dt = datetime.strptime(f"{curr_date} {hhmm}", "%Y-%m-%d %H:%M")
+    if expiry_date is not None:
+        expiry_dt = datetime.combine(expiry_date, datetime.min.time()).replace(
+            hour=15, minute=30
+        )
+        if expiry_dt <= ref_dt:
+            expiry_dt += timedelta(days=7)
+    else:
+        expiry_dt = nearest_expiry_datetime(ref_dt, instrument)
+    secs = max(60.0, (expiry_dt - ref_dt).total_seconds())
+    return secs / (365.0 * 24.0 * 3600.0)
+
+
+def term_structure_sigma(
+    days_to_expiry: float,
+    base_sigma: float = 0.14,
+    instrument: Optional[str] = None,
+) -> float:
+    """Implied volatility term structure for weekly index options.
+
+    Calibrated from real option premiums for each index. NIFTY ATM IV is
+    roughly 12-14% with 4-5 days left but rises steeply to ~32-36% in the
+    final day (0DTE gamma). SENSEX ATM IV is lower and flatter (~15-17% at
+    6-8 days, ~20-23% at 2-3 days, ~27% at 1 day). Used only when real
+    option candles are unavailable.
+    """
+    days = max(0.0, float(days_to_expiry))
+    if (instrument or "").upper() == "SENSEX":
+        long_iv = max(0.10, base_sigma)
+        near_iv = max(long_iv, 0.28)
+        decay = 0.30
+    else:
+        long_iv = max(0.10, base_sigma)
+        near_iv = max(long_iv, 0.36)
+        decay = 0.90
+    return long_iv + (near_iv - long_iv) * math.exp(-decay * max(0.0, days - 1.0))
 
 
 def str2bool(v):
@@ -337,6 +434,173 @@ def fetch_5m_candles(smart_api: SmartConnect, exchange: str, token: str, days_ba
 
 
 # ============================================================
+# REAL OPTION PRICE LOOKUP (historical market premiums)
+# ============================================================
+
+OPTION_CACHE_DIR = ROOT / "backtest" / "cache_daybreakout_options"
+_option_price_cache: Dict[Tuple[str, str], Dict[str, float]] = {}
+_contract_token_cache: Dict[Tuple[str, str, float, str, str], Optional[str]] = {}
+_expiry_date_cache: Dict[Tuple[str, str, str], Optional[Any]] = {}
+
+
+def nearest_expiry_for_date(symbol_base: str, exchange: str, date_str: str) -> Optional[Any]:
+    """Nearest weekly expiry on/after date_str from the scrip master.
+
+    Returns None when the master does not cover that period (e.g. old backtests)
+    or when the nearest expiry is too far away to be the weekly contract.
+    """
+    key = (symbol_base.upper(), exchange.upper(), date_str)
+    if key in _expiry_date_cache:
+        return _expiry_date_cache[key]
+
+    try:
+        ref_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        _expiry_date_cache[key] = None
+        return None
+
+    expiries = set()
+    for item in load_scrip_master():
+        if (
+            item.get("name") == symbol_base
+            and item.get("exch_seg") == exchange
+            and item.get("instrumenttype") == "OPTIDX"
+        ):
+            exp_str = item.get("expiry")
+            if not exp_str:
+                continue
+            try:
+                exp_date = datetime.strptime(exp_str, "%d%b%Y").date()
+            except ValueError:
+                continue
+            if exp_date >= ref_date:
+                expiries.add(exp_date)
+
+    expiry = min(expiries) if expiries else None
+    # Guard against using a months-away expiry when historical data isn't covered.
+    if expiry is not None and (expiry - ref_date).days > 14:
+        expiry = None
+    _expiry_date_cache[key] = expiry
+    return expiry
+
+
+def resolve_option_token(symbol_base: str, exchange: str, strike: float, option_type: str, date_str: str) -> Optional[str]:
+    """Resolves the broker token for an option contract on a given historical date."""
+    expiry = nearest_expiry_for_date(symbol_base, exchange, date_str)
+    if expiry is None:
+        return None
+
+    key = (symbol_base.upper(), exchange.upper(), float(strike), option_type.upper(), expiry.isoformat())
+    if key in _contract_token_cache:
+        return _contract_token_cache[key]
+
+    contract = find_option_contract(
+        symbol_base=symbol_base,
+        exchange=exchange,
+        strike=strike,
+        option_type=option_type,
+        expiry_date=expiry,
+    )
+    token = contract.get("token") if contract else None
+    _contract_token_cache[key] = token
+    return token
+
+
+def fetch_option_day_prices(smart_api: SmartConnect, exchange: str, token: str, date_str: str) -> Dict[str, float]:
+    """Fetches 15-minute closing prices for one option on one date.
+
+    Returns a mapping of candle start HH:MM -> close. Cached in memory and on disk.
+    """
+    key = (date_str, str(token))
+    if key in _option_price_cache:
+        return _option_price_cache[key]
+
+    OPTION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_file = OPTION_CACHE_DIR / f"{date_str}_{token}_{exchange}.json"
+    if cache_file.exists():
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                prices = {str(k): float(v) for k, v in json.load(f).items()}
+            _option_price_cache[key] = prices
+            return prices
+        except Exception:
+            pass
+
+    params = {
+        "exchange": exchange,
+        "symboltoken": str(token),
+        "interval": "FIFTEEN_MINUTE",
+        "fromdate": f"{date_str} 09:15",
+        "todate": f"{date_str} 15:30",
+    }
+
+    max_attempts = 4
+    base_wait = 2  # seconds
+    for attempt in range(1, max_attempts + 1):
+        try:
+            res = smart_api.getCandleData(params)
+        except Exception as exc:
+            if "access rate" in str(exc).lower() or "JSONDecodeError" in type(exc).__name__:
+                time.sleep(base_wait * attempt)
+                continue
+            raise
+
+        if res and res.get("status") and res.get("data"):
+            prices: Dict[str, float] = {}
+            for c in res["data"]:
+                prices[str(c[0])[11:16]] = float(c[4])
+            _option_price_cache[key] = prices
+            try:
+                with open(cache_file, "w", encoding="utf-8") as f:
+                    json.dump(prices, f)
+            except Exception:
+                pass
+            time.sleep(0.35)  # gentle pacing to avoid API rate limits
+            return prices
+
+        msg = str((res or {}).get("message", ""))
+        if "access rate" in msg.lower():
+            time.sleep(base_wait * attempt)
+            continue
+
+        # Contract/date has no traded candles (e.g. illiquid deep OTM strike).
+        _option_price_cache[key] = {}
+        return {}
+
+    return {}
+
+
+def price_at(prices: Optional[Dict[str, float]], hhmm: str) -> Optional[float]:
+    """Latest known option price at or before hhmm."""
+    if not prices:
+        return None
+    if hhmm in prices:
+        return prices[hhmm]
+    prior = [k for k in prices if k <= hhmm]
+    if not prior:
+        return None
+    return prices[max(prior)]
+
+
+def market_premium_at(
+    buy_prices: Optional[Dict[str, float]],
+    sell_prices: Optional[Dict[str, float]],
+    hhmm: str,
+    is_naked: bool,
+) -> Optional[float]:
+    """Net market premium at hhmm, or None when market prices are unavailable."""
+    buy_px = price_at(buy_prices, hhmm)
+    if buy_px is None:
+        return None
+    if is_naked:
+        return buy_px
+    sell_px = price_at(sell_prices, hhmm)
+    if sell_px is None:
+        return None
+    return buy_px - sell_px
+
+
+# ============================================================
 # BACKTEST ENGINE
 # ============================================================
 def run_15m_backtest(
@@ -344,6 +608,8 @@ def run_15m_backtest(
     days_back: int = 15,
     lots: int = 5,
     max_loss: float = RISK_CONFIG["max_loss"],
+    fixed_loss_amount: float = RISK_CONFIG.get("fixed_loss_amount", 15000.0),
+    enable_fixed_loss_sl: bool = RISK_CONFIG.get("enable_fixed_loss_sl", True),
     max_profit: float = RISK_CONFIG["max_profit"],
     profit_threshold: float = RISK_CONFIG["profit_threshold"],
     min_profit_step: float = RISK_CONFIG["min_profit_step"],
@@ -362,6 +628,7 @@ def run_15m_backtest(
     end_date: Optional[datetime] = None,
     combination: bool = False,
     x_factor: float = RISK_CONFIG.get("x_factor", 1.0),
+    tag: str = "",
 ) -> Dict[str, Any]:
     """Runs the 15-minute candle Day Breakout backtest with Gap & Opening Rules and VIX volatility filter."""
     if combination:
@@ -402,6 +669,7 @@ def run_15m_backtest(
         else:
             total_qty = lots * unit_lot_size
         max_loss = max_loss * x_factor
+        fixed_loss_amount = fixed_loss_amount * x_factor
         max_profit = max_profit * x_factor
         profit_threshold = profit_threshold * x_factor
         min_profit_step = min_profit_step * x_factor
@@ -411,6 +679,7 @@ def run_15m_backtest(
         print(f"    Scaled Lots: {lots} (Base: {int(lots/x_factor)})")
         print(f"    Scaled Total Qty: {total_qty}")
         print(f"    Scaled Max Loss: Rs.{max_loss:.0f}")
+        print(f"    Scaled Fixed Loss SL: Rs.{fixed_loss_amount:.0f}")
         print(f"    Scaled Max Profit: Rs.{max_profit:.0f}")
         print(f"    Scaled Profit Threshold: Rs.{profit_threshold:.0f}")
         print(f"    Scaled Daily Max Loss: Rs.{daily_max_loss:.0f}")
@@ -490,7 +759,7 @@ def run_15m_backtest(
     print(f"  Entry Window             : {first_entry_hhmm} to {BREAKOUT_CONFIG.get('last_entry_hhmm', '14:45')}")
     print(f"  Option Structure         : {struct_clean.upper()} {'(' + str(spread_width) + ' pt spread)' if struct_clean == 'spread' else '(Single Leg Option Buy)'}")
     print(f"  Position Sizing          : {lots} lots ({total_qty} | Lot Size: {unit_lot_size} [{lot_source}])")
-    print(f"  Risk Parameters          : Max Loss Rs.{max_loss:.0f} | Trailing Min Profit Rs.{profit_threshold:.0f}")
+    print(f"  Risk Parameters          : Max Loss Rs.{max_loss:.0f} | Fixed Loss SL {'ON' if enable_fixed_loss_sl else 'OFF'} Rs.{fixed_loss_amount:.0f} | Trailing Min Profit Rs.{profit_threshold:.0f}")
     print(f"  Daily Limits             : Max Loss Rs.{daily_max_loss:.0f} | Max Profit Rs.{daily_max_profit:.0f} | SL Cooldown {sl_cooldown_minutes}m")
     print(f"  Gap Rules                : ACTIVE (LARGE gap extra wait = {large_gap_extra_wait_sec}s = {extra_candles_wait} candle(s))")
     print(f"  VIX Volatility Filter    : ACTIVE (Neg Inst & VIX > +{vix_bearish_thresh:.1f}% -> No Reverse | Pos Inst & VIX <= {vix_bullish_thresh:.1f}% -> No Reverse)")
@@ -541,8 +810,15 @@ def run_15m_backtest(
             strike_step = inst_info["strike_step"]
             spread_width = inst_info["spread_width"]
             sigma = 0.15 if active_inst_name == "SENSEX" else 0.14
-            instrument_offset = 200 if active_inst_name == "SENSEX" else 100
-            unit_lot_size = inst_info.get("default_lot_size", 25 if active_inst_name == "SENSEX" else 65)
+            try:
+                from live.daybreakout.contract_finder import get_instrument_lot_size
+                unit_lot_size = get_instrument_lot_size(
+                    active_inst_name, inst_info.get("option_exchange")
+                )
+            except Exception:
+                unit_lot_size = inst_info.get(
+                    "default_lot_size", 25 if active_inst_name == "SENSEX" else 65
+                )
             total_qty = lots * unit_lot_size
 
             prev_15m_candles = days_15m_by_inst[active_inst_name][prev_date]
@@ -597,7 +873,10 @@ def run_15m_backtest(
                 break
 
             candle  = curr_15m_candles[c_idx]
+            # Signal rules use the candle's start label; trade logs use when
+            # that candle actually closes and the close-based signal is known.
             c_time  = candle[0][11:16]
+            c_end_time = candle_end_hhmm(candle[0])
             c_open  = float(candle[1])
             c_high  = float(candle[2])
             c_low   = float(candle[3])
@@ -731,6 +1010,8 @@ def run_15m_backtest(
 
                 # Exit-type specific cooldown check
                 if last_exit_dt is not None and last_exit_reason is not None:
+                    # Keep decision timing on the original candle-start clock;
+                    # c_end_time is only the user-facing trade-log timestamp.
                     candle_dt   = datetime.strptime(f"{curr_date} {c_time}", "%Y-%m-%d %H:%M")
                     elapsed_min = (candle_dt - last_exit_dt).total_seconds() / 60.0
                     cooldown_minutes = exit_cooldown_minutes.get(last_exit_reason, 0)
@@ -740,6 +1021,17 @@ def run_15m_backtest(
                     if cooldown_minutes > 0 and elapsed_min < cooldown_minutes:
                         c_idx += 1
                         continue
+
+                # Profit round hour cooldown check
+                # If trade exited in profit at a round hour (e.g., 10:00, 11:00), wait 60 minutes
+                profit_round_hour_cooldown = RISK_CONFIG.get("profit_round_hour_cooldown_minutes", 60)
+                if last_exit_dt is not None and last_exit_reason in ("EXIT_TRAILING_PROFIT", "EXIT_MAX_PROFIT"):
+                    if last_exit_dt.minute == 0:  # Round hour
+                        candle_dt = datetime.strptime(f"{curr_date} {c_time}", "%Y-%m-%d %H:%M")
+                        elapsed_min = (candle_dt - last_exit_dt).total_seconds() / 60.0
+                        if elapsed_min < profit_round_hour_cooldown:
+                            c_idx += 1
+                            continue
 
                 orig_dir    = signal.direction
                 trade_type  = signal.trade_type
@@ -823,41 +1115,52 @@ def run_15m_backtest(
             opt_type = "CE" if breakout_dir == "BULLISH" else "PE"
 
             atm_strike = int(round(c_close / strike_step) * strike_step)
-            # Use instrument-specific strike offset: ±200 for SENSEX, ±100 for NIFTY
-            if active_inst_name == "SENSEX":
-                instrument_offset = 200
-            else:  # NIFTY/BANKNIFTY
-                instrument_offset = 100
 
-            # Check if it's expiry day based on instrument
-            curr_date_obj = datetime.strptime(curr_date, "%Y-%m-%d")
-            if active_inst_name in ("NIFTY", "BANKNIFTY"):
-                expiry_weekday = 1  # Tuesday
-            elif active_inst_name == "SENSEX":
-                expiry_weekday = 3  # Thursday
-            else:
-                expiry_weekday = 3  # Default to Thursday
-            is_expiry = (curr_date_obj.weekday() == expiry_weekday)
-
+            # Strike selection mirrors live find_strategy_contracts():
+            #   spread -> Buy ATM, Sell ATM +/- spread_width
+            #   naked  -> Buy ATM
             if struct_clean == "naked":
-                # For naked positions, use normal ATM on expiry day, otherwise offset
-                if is_expiry:
-                    buy_strike = atm_strike  # Use ATM on expiry day
-                else:
-                    # Offset strike based on direction on non-expiry days
-                    if breakout_dir == "BULLISH":
-                        buy_strike = atm_strike + instrument_offset  # CE: ATM + offset
-                    else:  # BEARISH
-                        buy_strike = atm_strike - instrument_offset  # PE: ATM - offset
+                buy_strike = atm_strike
                 sell_strike = None
             else:
-                # For spread positions, use normal ATM on expiry day, otherwise offset
-                if is_expiry:
-                    buy_strike = atm_strike
-                    sell_strike = atm_strike  # ATM spread on expiry day
-                else:
-                    buy_strike = atm_strike
-                    sell_strike = (atm_strike + instrument_offset) if breakout_dir == "BULLISH" else (atm_strike - instrument_offset)
+                buy_strike = atm_strike
+                sell_strike = (
+                    atm_strike + spread_width
+                    if breakout_dir == "BULLISH"
+                    else atm_strike - spread_width
+                )
+
+            # Expiry-day flag is kept only for reporting.
+            curr_date_obj = datetime.strptime(curr_date, "%Y-%m-%d")
+            is_expiry = (curr_date_obj.weekday() == expiry_weekday_for(active_inst_name))
+
+            # Resolve real option contracts and load historical market prices.
+            buy_prices: Optional[Dict[str, float]] = None
+            sell_prices: Optional[Dict[str, float]] = None
+            pricing_source = "MODEL"
+            option_exchange = INSTRUMENTS[active_inst_name]["option_exchange"]
+            active_expiry_date = nearest_expiry_for_date(
+                active_inst_name, option_exchange, curr_date
+            )
+            try:
+                buy_token = resolve_option_token(
+                    active_inst_name, option_exchange, buy_strike, opt_type, curr_date
+                )
+                if buy_token:
+                    buy_prices = fetch_option_day_prices(
+                        smart_api, option_exchange, buy_token, curr_date
+                    )
+                if struct_clean != "naked" and sell_strike is not None:
+                    sell_token = resolve_option_token(
+                        active_inst_name, option_exchange, sell_strike, opt_type, curr_date
+                    )
+                    if sell_token:
+                        sell_prices = fetch_option_day_prices(
+                            smart_api, option_exchange, sell_token, curr_date
+                        )
+            except Exception as exc:
+                print(f"[!] Market premium lookup failed for {curr_date} "
+                      f"{buy_strike}/{sell_strike} {opt_type}: {exc}")
 
             # Build human-readable Trade Reason
             if should_reverse:
@@ -871,49 +1174,112 @@ def run_15m_backtest(
                 trade_reason += f" [VIX Delay: {vix_delay_reason}]"
 
             daily_trades_count += 1
-            entry_time    = c_time
+            entry_time    = c_end_time
             entry_spot    = c_close
             
             # Calculate actual days to expiry based on current date and instrument
             days_to_expiry = calculate_days_to_expiry(curr_date, active_inst_name)
-            entry_premium = get_option_premium(entry_spot, buy_strike, sell_strike, breakout_dir, days_to_expiry=days_to_expiry, sigma=sigma, structure=struct_clean)
+            entry_ttx = time_to_expiry_years(
+                curr_date, entry_time, active_inst_name, expiry_date=active_expiry_date
+            )
+            market_entry = market_premium_at(
+                buy_prices, sell_prices, c_time, struct_clean == "naked"
+            )
+            if market_entry is not None and market_entry > 0:
+                entry_premium = market_entry
+                use_market_prices = True
+                pricing_source = "MARKET"
+            else:
+                entry_sigma = term_structure_sigma(
+                    entry_ttx * 365.0, sigma, instrument=active_inst_name
+                )
+                entry_premium = get_option_premium(
+                    entry_spot, buy_strike, sell_strike, breakout_dir,
+                    days_to_expiry=days_to_expiry, sigma=entry_sigma,
+                    structure=struct_clean, time_to_expiry_years=entry_ttx,
+                )
+                use_market_prices = False
+                pricing_source = "MODEL"
 
             # Intraday Trade Monitor on 15-minute candles for profit tracking (matches live trading)
             max_trade_pnl = 0.0
+            min_trade_pnl = 0.0
             locked_profit = profit_threshold
             exit_reason   = "EXIT_EOD"
             exit_time     = "15:10"
+            exit_candle_start_time = None
             exit_spot     = entry_spot
             exit_pnl      = 0.0
             exit_premium  = 0.0  # Will be calculated at exit
 
-            # Find the first 15-minute candle after entry time
-            entry_datetime = datetime.strptime(f"{curr_date} {entry_time}", "%Y-%m-%d %H:%M")
+            # Preserve the original candle selection: start monitoring after
+            # the entry candle, while recording the entry at its close time.
+            entry_candle_start_datetime = datetime.strptime(
+                f"{curr_date} {c_time}", "%Y-%m-%d %H:%M"
+            )
             
             forward_idx = 0
             while forward_idx < len(curr_15m_profit_candles):
                 f_candle = curr_15m_profit_candles[forward_idx]
                 # Handle both ISO format (2026-09-01T09:15:00) and space format (2026-09-01 09:15:00)
-                f_timestamp = f_candle[0].replace("T", " ")
-                f_datetime = datetime.strptime(f_timestamp[:19], "%Y-%m-%d %H:%M:%S")
-                if f_datetime > entry_datetime:
+                f_datetime = datetime.strptime(
+                    f"{curr_date} {f_candle[0][11:16]}", "%Y-%m-%d %H:%M"
+                )
+                if f_datetime > entry_candle_start_datetime:
                     break
                 forward_idx += 1
 
             # Monitor on 15-minute candles for profit tracking
             while forward_idx < len(curr_15m_profit_candles):
                 f_candle = curr_15m_profit_candles[forward_idx]
-                f_time   = f_candle[0][11:16]
+                f_start_time = f_candle[0][11:16]
+                f_time   = candle_end_hhmm(f_candle[0])
                 f_close  = float(f_candle[4])
 
-                curr_premium = get_option_premium(f_close, buy_strike, sell_strike, breakout_dir, days_to_expiry=days_to_expiry, sigma=sigma, structure=struct_clean)
+                candle_ttx = time_to_expiry_years(
+                    curr_date, f_time, active_inst_name, expiry_date=active_expiry_date
+                )
+                candle_sigma = term_structure_sigma(
+                    candle_ttx * 365.0, sigma, instrument=active_inst_name
+                )
+                if use_market_prices:
+                    market_curr = market_premium_at(
+                        buy_prices, sell_prices, f_start_time, struct_clean == "naked"
+                    )
+                    if market_curr is not None and market_curr > 0:
+                        curr_premium = market_curr
+                    else:
+                        curr_premium = get_option_premium(
+                            f_close, buy_strike, sell_strike, breakout_dir,
+                            days_to_expiry=days_to_expiry, sigma=candle_sigma,
+                            structure=struct_clean, time_to_expiry_years=candle_ttx,
+                        )
+                else:
+                    curr_premium = get_option_premium(
+                        f_close, buy_strike, sell_strike, breakout_dir,
+                        days_to_expiry=days_to_expiry, sigma=candle_sigma,
+                        structure=struct_clean, time_to_expiry_years=candle_ttx,
+                    )
                 current_pnl  = (curr_premium - entry_premium) * total_qty
+                min_trade_pnl = min(min_trade_pnl, current_pnl)
+
+                # Simulate the broker-side fixed monetary stop. If a sampled
+                # candle gaps past the trigger, use the configured stop price.
+                if enable_fixed_loss_sl and current_pnl <= -abs(fixed_loss_amount):
+                    exit_reason = "EXIT_FIXED_LOSS_SL"
+                    exit_time   = f_time
+                    exit_candle_start_time = f_start_time
+                    exit_spot   = f_close
+                    exit_premium = max(0.0, entry_premium - abs(fixed_loss_amount) / total_qty)
+                    exit_pnl    = (exit_premium - entry_premium) * total_qty
+                    break
 
                 # Check if daily max loss would be breached if we exit now
                 potential_daily_pnl = daily_pnl + current_pnl
                 if potential_daily_pnl <= daily_max_loss:
                     exit_reason = "EXIT_DAILY_MAX_LOSS"
                     exit_time   = f_time
+                    exit_candle_start_time = f_start_time
                     exit_spot   = f_close
                     exit_pnl    = current_pnl
                     exit_premium = curr_premium
@@ -923,6 +1289,7 @@ def run_15m_backtest(
                 if current_pnl <= max_loss:
                     exit_reason = "EXIT_MAX_LOSS"
                     exit_time   = f_time
+                    exit_candle_start_time = f_start_time
                     exit_spot   = f_close
                     exit_pnl    = current_pnl  # Use actual P&L at trigger time for realism
                     exit_premium = curr_premium
@@ -940,6 +1307,7 @@ def run_15m_backtest(
                 if max_trade_pnl >= profit_threshold and current_pnl < locked_profit:
                     exit_reason = "EXIT_TRAILING_PROFIT"
                     exit_time   = f_time
+                    exit_candle_start_time = f_start_time
                     exit_spot   = f_close
                     exit_pnl    = current_pnl  # Use actual P&L at trigger time for realism
                     exit_premium = curr_premium
@@ -949,15 +1317,17 @@ def run_15m_backtest(
                 if current_pnl >= max_profit:
                     exit_reason = "EXIT_MAX_PROFIT"
                     exit_time   = f_time
+                    exit_candle_start_time = f_start_time
                     exit_spot   = f_close
                     exit_pnl    = current_pnl  # Use actual P&L at trigger time for realism
                     exit_premium = curr_premium
                     break
 
                 # End of day check
-                if f_time >= "15:00" or forward_idx == len(curr_15m_profit_candles) - 1:
+                if f_start_time >= "15:00" or forward_idx == len(curr_15m_profit_candles) - 1:
                     exit_reason = "EXIT_EOD"
-                    exit_time   = "15:10"
+                    exit_time   = f_time
+                    exit_candle_start_time = f_start_time
                     exit_spot   = f_close
                     exit_pnl    = current_pnl
                     exit_premium = curr_premium
@@ -967,14 +1337,35 @@ def run_15m_backtest(
 
             # Calculate exit premium if not already set during exit conditions
             if exit_premium == 0:
-                exit_premium = get_option_premium(exit_spot, buy_strike, sell_strike, breakout_dir, days_to_expiry=days_to_expiry, sigma=sigma, structure=struct_clean)
+                exit_key = exit_candle_start_time or exit_time
+                market_exit = None
+                if use_market_prices:
+                    market_exit = market_premium_at(
+                        buy_prices, sell_prices, exit_key, struct_clean == "naked"
+                    )
+                if market_exit is not None and market_exit > 0:
+                    exit_premium = market_exit
+                else:
+                    exit_ttx = time_to_expiry_years(
+                        curr_date, exit_time, active_inst_name, expiry_date=active_expiry_date
+                    )
+                    exit_sigma = term_structure_sigma(
+                        exit_ttx * 365.0, sigma, instrument=active_inst_name
+                    )
+                    exit_premium = get_option_premium(
+                        exit_spot, buy_strike, sell_strike, breakout_dir,
+                        days_to_expiry=days_to_expiry, sigma=exit_sigma,
+                        structure=struct_clean, time_to_expiry_years=exit_ttx,
+                    )
 
-            # Record exit time and reason for cooldown tracking
-            last_exit_dt = datetime.strptime(f"{curr_date} {exit_time}", "%Y-%m-%d %H:%M")
+            # Cooldowns retain the original candle-start clock so changing
+            # displayed timestamps cannot alter which trades the backtest takes.
+            cooldown_exit_time = exit_candle_start_time or exit_time
+            last_exit_dt = datetime.strptime(f"{curr_date} {cooldown_exit_time}", "%Y-%m-%d %H:%M")
             last_exit_reason = exit_reason
 
             # Keep legacy SL cooldown for backward compatibility
-            if exit_reason == "EXIT_MAX_LOSS" or exit_reason == "EXIT_DAILY_MAX_LOSS":
+            if exit_reason in ("EXIT_MAX_LOSS", "EXIT_DAILY_MAX_LOSS", "EXIT_FIXED_LOSS_SL"):
                 last_sl_exit_dt = last_exit_dt
 
             daily_pnl += exit_pnl
@@ -1009,10 +1400,12 @@ def run_15m_backtest(
                 "no_chase":            same_gap_direction and gap_info.no_chase_same_direction,
                 "structure":           struct_clean.upper(),
                 "trade_type":          trade_type,
+                "mode":                "REVERSE" if reverse else "NO-REVERSE",
                 "direction":           breakout_dir,
                 "opt_type":            opt_type,
                 "entry_time":          entry_time,
                 "entry_spot":          entry_spot,
+                "pricing_source":      pricing_source,
                 "buy_strike":          buy_strike,
                 "sell_strike":         sell_strike if sell_strike else "N/A",
                 "entry_premium":       round(entry_premium, 2),
@@ -1021,7 +1414,8 @@ def run_15m_backtest(
                 "exit_premium":        round(exit_premium, 2),
                 "trade_reason":        trade_reason,
                 "exit_reason":         exit_reason,
-                "pnl":                 exit_pnl,
+                "pnl":                 round(exit_pnl, 2),
+                "min_unrealized_pnl":  round(min_trade_pnl, 2),
                 "lots":                lots,
                 "quantity":            total_qty,
             }
@@ -1032,10 +1426,13 @@ def run_15m_backtest(
                 break
 
             # Advance 15-minute candle index past the trade exit
+            if exit_candle_start_time is None:
+                # Fallback 15:10 EOD exit when no profit-check candle exists.
+                exit_candle_start_time = exit_time
             exit_15m_idx = c_idx + 1
             while exit_15m_idx < len(curr_15m_candles):
                 exit_candle_time = curr_15m_candles[exit_15m_idx][0][11:16]
-                if exit_candle_time >= exit_time:
+                if exit_candle_time >= exit_candle_start_time:
                     break
                 exit_15m_idx += 1
             c_idx = exit_15m_idx
@@ -1093,7 +1490,8 @@ def run_15m_backtest(
     # SAVE DETAILED TRADE LOG
     # ============================================================
     x_factor_suffix = f"_x{x_factor}" if x_factor != 1.0 else ""
-    csv_file = DATA_DIR / f"backtest_daybreakout_15m_{inst_key}_{struct_clean}{x_factor_suffix}.csv"
+    tag_suffix = f"_{tag}" if tag else ""
+    csv_file = DATA_DIR / f"backtest_daybreakout_15m_{inst_key}_{struct_clean}{x_factor_suffix}{tag_suffix}.csv"
     if all_trades:
         with open(csv_file, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=list(all_trades[0].keys()))
@@ -1171,9 +1569,9 @@ def main():
     parser.add_argument("--instrument", "-i", choices=["NIFTY", "SENSEX"], default="NIFTY", help="Instrument to backtest (default: NIFTY)")
     parser.add_argument("--combination", type=str2bool, nargs="?", const=True, default=False, help="Combination mode (true/false): test nearest expiry instrument per day (default: false)")
     parser.add_argument("--structure", "-s", choices=["spread", "naked"], default="spread", help="Option structure to test (spread or naked) (default: spread)")
-    parser.add_argument("--days", "-d", type=int, default=15, help="Number of past days to backtest (default: 15)")
-    parser.add_argument("--lots", "-l", type=int, default=5, help="Lots to trade (default: 5)")
-    parser.add_argument("--x-factor", "-x", type=float, default=1.0, help="Multiplier for position sizing and risk parameters (default: 1.0, e.g., 1.5 for 50%% more, 2.0 for double)")
+    parser.add_argument("--days", "-d", type=int, default=185, help="Number of past days to backtest (default: 185)")
+    parser.add_argument("--lots", "-l", type=int, default=15, help="Lots to trade (default: 15)")
+    parser.add_argument("--x-factor", "-x", type=float, default=RISK_CONFIG.get("x_factor", 1.0), help="Multiplier for position sizing and risk parameters (default: from RISK_CONFIG, e.g., 1.5 for 50%% more, 2.0 for double)")
     parser.add_argument("--end-date", type=str, default=None, help="End date for backtest in YYYY-MM-DD format (default: today)")
     parser.add_argument("--vix-bearish-thresh", type=float, default=VIX_CONFIG["bearish_vix_threshold"], help="VIX spike threshold (pct) above which bearish breakdown does not reverse (default: {})".format(VIX_CONFIG["bearish_vix_threshold"]))
     parser.add_argument("--vix-bullish-thresh", type=float, default=VIX_CONFIG["bullish_vix_threshold"], help="VIX crush threshold (pct) below which bullish breakout does not reverse (default: {})".format(VIX_CONFIG["bullish_vix_threshold"]))
@@ -1184,6 +1582,7 @@ def main():
     reverse_group = parser.add_mutually_exclusive_group()
     reverse_group.add_argument("--reverse", dest="reverse", action="store_true", default=True, help="Reverse trade direction (default: ON)")
     reverse_group.add_argument("--no-reverse", dest="reverse", action="store_false", help="Do NOT reverse trade direction")
+    parser.add_argument("--tag", type=str, default="", help="Optional tag for output CSV (e.g. reverse, no-reverse)")
     args = parser.parse_args()
 
     # Parse end date if provided
@@ -1197,8 +1596,8 @@ def main():
 
     run_15m_backtest(
         instrument_name=args.instrument,
-        days_back= 185, #args.days,
-        lots= 15, #args.lots,
+        days_back=args.days,
+        lots=args.lots,
         daily_max_profit=args.daily_max_profit,
         sl_cooldown_minutes=args.sl_cooldown,
         first_entry_hhmm=args.first_entry,
@@ -1209,6 +1608,7 @@ def main():
         end_date=end_date,
         combination=args.combination,
         x_factor=args.x_factor,
+        tag=args.tag,
     )
 
 

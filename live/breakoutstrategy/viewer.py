@@ -5,7 +5,9 @@ Open: http://localhost:8765
 Auto-refreshes every 5 minutes in the browser.
 """
 
+import collections
 import csv
+import json
 import sys
 from datetime import datetime, time as dt_time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -927,9 +929,24 @@ def read_daybreakout_summary(instrument: str) -> tuple:
         DATA_DIR / f"backtest_daybreakout_15m_{instr}_naked.csv",
         DATA_DIR / f"backtest_daybreakout_15m_{instr}.csv",
     ]
+    # Dynamically find any non-dual daybreakout backtest files for this instrument
+    extra_matches = [
+        p for p in DATA_DIR.glob(f"backtest_daybreakout_15m_{instr}*.csv")
+        if not any(k in p.name.lower() for k in ("_dual", "_reverse", "_no-reverse", "comparison"))
+    ]
+    all_candidates = []
+    seen = set()
+    for c in candidates + extra_matches:
+        if c not in seen:
+            seen.add(c)
+            all_candidates.append(c)
+
+    # Sort candidates by modification time (most recent first)
+    all_candidates.sort(key=lambda x: x.stat().st_mtime if x.exists() else 0, reverse=True)
+
     records = []
     found_file = f"backtest_daybreakout_15m_{instr}_spread.csv"
-    for csv_file in candidates:
+    for csv_file in all_candidates:
         if csv_file.is_file():
             found_file = csv_file.name
             with open(csv_file, mode="r", encoding="utf-8") as f:
@@ -944,6 +961,50 @@ def read_daybreakout_summary(instrument: str) -> tuple:
                     records.append(row)
             break
     return records, found_file
+
+
+def read_dual_mode_trades(instrument: str = "NIFTY", for_date: str = None) -> tuple:
+    """Read dual-mode trades (REVERSE and NO-REVERSE) for a specific date."""
+    instr = instrument.upper()
+    date_key = for_date or datetime.now(IST).strftime("%Y-%m-%d")
+
+    # Look for dual-mode trade files in the trades/<date>/ directory
+    trades_dir = DATA_DIR / "trades" / date_key
+
+    reverse_records = []
+    no_reverse_records = []
+
+    # Try to read REVERSE mode trades
+    reverse_file = trades_dir / f"trades_{instr}_reverse.csv"
+    if reverse_file.exists():
+        with open(reverse_file, mode="r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    row["pnl"] = float(row.get("pnl", 0.0))
+                    row["mode"] = "REVERSE"
+                    reverse_records.append(row)
+                except ValueError:
+                    row["pnl"] = 0.0
+                    row["mode"] = "REVERSE"
+                    reverse_records.append(row)
+
+    # Try to read NO-REVERSE mode trades
+    no_reverse_file = trades_dir / f"trades_{instr}_no-reverse.csv"
+    if no_reverse_file.exists():
+        with open(no_reverse_file, mode="r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    row["pnl"] = float(row.get("pnl", 0.0))
+                    row["mode"] = "NO-REVERSE"
+                    no_reverse_records.append(row)
+                except ValueError:
+                    row["pnl"] = 0.0
+                    row["mode"] = "NO-REVERSE"
+                    no_reverse_records.append(row)
+
+    return reverse_records, no_reverse_records
 
 
 def build_3leg_summary_content() -> tuple:
@@ -1152,6 +1213,135 @@ def build_3leg_summary_content() -> tuple:
     return summary + daily_table_html + monthly_table_html, total_days, total_pnl
 
 
+def compute_daily_pnl_metrics(records: list) -> dict:
+    daily_pnl = collections.defaultdict(float)
+    daily_trades = collections.defaultdict(int)
+    for r in records:
+        d = r.get("date", "").strip()
+        if d:
+            try:
+                pnl_val = float(r.get("pnl", 0.0))
+            except (ValueError, TypeError):
+                pnl_val = 0.0
+            daily_pnl[d] += pnl_val
+            daily_trades[d] += 1
+
+    total_days = len(daily_pnl)
+    if total_days == 0:
+        return {
+            "total_days": 0, "net_profit_days": 0, "net_loss_days": 0, "breakeven_days": 0,
+            "profit_days_pct": 0.0, "loss_days_pct": 0.0,
+            "max_net_profit": 0.0, "max_profit_day": "—",
+            "max_net_loss": 0.0, "max_loss_day": "—",
+            "avg_profit": 0.0, "avg_loss": 0.0,
+            "max_p_fmt": "Rs. 0.00", "max_l_fmt": "Rs. 0.00",
+            "avg_p_fmt": "Rs. 0.00", "avg_l_fmt": "Rs. 0.00",
+        }
+
+    profit_days = [p for p in daily_pnl.values() if p > 0]
+    loss_days = [p for p in daily_pnl.values() if p < 0]
+    be_days = [p for p in daily_pnl.values() if p == 0]
+
+    net_profit_days = len(profit_days)
+    net_loss_days = len(loss_days)
+    profit_days_pct = (net_profit_days / total_days * 100) if total_days > 0 else 0.0
+    loss_days_pct = (net_loss_days / total_days * 100) if total_days > 0 else 0.0
+
+    max_profit_item = max(daily_pnl.items(), key=lambda x: x[1])
+    max_net_profit = max_profit_item[1]
+    max_profit_day = max_profit_item[0]
+
+    min_loss_item = min(daily_pnl.items(), key=lambda x: x[1])
+    max_net_loss = min_loss_item[1]
+    max_loss_day = min_loss_item[0]
+
+    avg_profit = (sum(profit_days) / len(profit_days)) if profit_days else 0.0
+    avg_loss = (sum(loss_days) / len(loss_days)) if loss_days else 0.0
+
+    max_p_fmt = f"+Rs. {max_net_profit:,.2f}" if max_net_profit >= 0 else f"-Rs. {abs(max_net_profit):,.2f}"
+    max_l_fmt = f"-Rs. {abs(max_net_loss):,.2f}" if max_net_loss <= 0 else f"+Rs. {max_net_loss:,.2f}"
+    avg_p_fmt = f"+Rs. {avg_profit:,.2f}" if avg_profit >= 0 else f"-Rs. {abs(avg_profit):,.2f}"
+    avg_l_fmt = f"-Rs. {abs(avg_loss):,.2f}" if avg_loss <= 0 else f"+Rs. {avg_loss:,.2f}"
+
+    return {
+        "total_days": total_days,
+        "net_profit_days": net_profit_days,
+        "net_loss_days": net_loss_days,
+        "breakeven_days": len(be_days),
+        "profit_days_pct": profit_days_pct,
+        "loss_days_pct": loss_days_pct,
+        "max_net_profit": max_net_profit,
+        "max_profit_day": max_profit_day,
+        "max_net_loss": max_net_loss,
+        "max_loss_day": max_loss_day,
+        "avg_profit": avg_profit,
+        "avg_loss": avg_loss,
+        "max_p_fmt": max_p_fmt,
+        "max_l_fmt": max_l_fmt,
+        "avg_p_fmt": avg_p_fmt,
+        "avg_l_fmt": avg_l_fmt,
+    }
+
+
+def render_daily_metrics_cards(metrics: dict) -> str:
+    if not metrics or metrics.get("total_days", 0) == 0:
+        return ""
+    total_days = metrics["total_days"]
+    net_profit_days = metrics["net_profit_days"]
+    net_loss_days = metrics["net_loss_days"]
+    p_pct = metrics["profit_days_pct"]
+    l_pct = metrics["loss_days_pct"]
+    max_p_fmt = metrics["max_p_fmt"]
+    max_p_day = metrics["max_profit_day"]
+    max_l_fmt = metrics["max_l_fmt"]
+    max_l_day = metrics["max_loss_day"]
+    avg_p_fmt = metrics["avg_p_fmt"]
+    avg_l_fmt = metrics["avg_l_fmt"]
+
+    return f"""
+    <div class="day-stats-bar" style="margin-top:20px; background:#ffffff; border:1px solid var(--border); border-radius:10px; padding:18px 22px; box-shadow:var(--shadow);">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; border-bottom:1px solid var(--border-light); padding-bottom:10px;">
+        <span style="font-size:15px; font-weight:700; color:var(--text);">&#128197; DAILY NET P&amp;L PERFORMANCE METRICS</span>
+        <span style="font-size:12px; font-weight:600; color:var(--text-muted); background:var(--surface2); padding:3px 10px; border-radius:12px; border:1px solid var(--border-light);">
+          {total_days} Trading Days Analyzed
+        </span>
+      </div>
+      <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:14px;">
+        <div style="background:var(--green-bg); border:1px solid var(--green-border); border-radius:8px; padding:12px 16px;">
+          <div style="font-size:11px; font-weight:700; text-transform:uppercase; color:var(--green); letter-spacing:0.5px;">Net Profit Days</div>
+          <div style="font-size:22px; font-weight:800; color:var(--green); margin-top:4px;">{net_profit_days} <span style="font-size:13px; font-weight:600;">({p_pct:.1f}%)</span></div>
+          <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Out of {total_days} total days</div>
+        </div>
+        <div style="background:var(--red-bg); border:1px solid var(--red-border); border-radius:8px; padding:12px 16px;">
+          <div style="font-size:11px; font-weight:700; text-transform:uppercase; color:var(--red); letter-spacing:0.5px;">Net Loss Days</div>
+          <div style="font-size:22px; font-weight:800; color:var(--red); margin-top:4px;">{net_loss_days} <span style="font-size:13px; font-weight:600;">({l_pct:.1f}%)</span></div>
+          <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Out of {total_days} total days</div>
+        </div>
+        <div style="background:var(--green-bg); border:1px solid var(--green-border); border-radius:8px; padding:12px 16px;">
+          <div style="font-size:11px; font-weight:700; text-transform:uppercase; color:var(--green); letter-spacing:0.5px;">Max Net Profit (Single Day)</div>
+          <div style="font-size:18px; font-weight:800; color:var(--green); margin-top:6px;">{max_p_fmt}</div>
+          <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Peak: {max_p_day}</div>
+        </div>
+        <div style="background:var(--red-bg); border:1px solid var(--red-border); border-radius:8px; padding:12px 16px;">
+          <div style="font-size:11px; font-weight:700; text-transform:uppercase; color:var(--red); letter-spacing:0.5px;">Max Net Loss (Single Day)</div>
+          <div style="font-size:18px; font-weight:800; color:var(--red); margin-top:6px;">{max_l_fmt}</div>
+          <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Worst: {max_l_day}</div>
+        </div>
+        <div style="background:var(--surface2); border:1px solid var(--border); border-radius:8px; padding:12px 16px;">
+          <div style="font-size:11px; font-weight:700; text-transform:uppercase; color:var(--text-muted); letter-spacing:0.5px;">Avg Profit (Winning Days)</div>
+          <div style="font-size:18px; font-weight:800; color:var(--green); margin-top:6px;">{avg_p_fmt}</div>
+          <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Avg on {net_profit_days} profit days</div>
+        </div>
+        <div style="background:var(--surface2); border:1px solid var(--border); border-radius:8px; padding:12px 16px;">
+          <div style="font-size:11px; font-weight:700; text-transform:uppercase; color:var(--text-muted); letter-spacing:0.5px;">Avg Loss (Losing Days)</div>
+          <div style="font-size:18px; font-weight:800; color:var(--red); margin-top:6px;">{avg_l_fmt}</div>
+          <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Avg on {net_loss_days} loss days</div>
+        </div>
+      </div>
+    </div>
+    """
+
+
 def build_daybreakout_summary_content(instrument: str = "NIFTY") -> tuple:
     records, fn = read_daybreakout_summary(instrument)
     label = instrument.upper()
@@ -1177,6 +1367,10 @@ def build_daybreakout_summary_content(instrument: str = "NIFTY") -> tuple:
         pnl_val = r["pnl"]
         pnl_class = "pnl-positive" if pnl_val >= 0 else "pnl-negative"
         pnl_badge = f"+Rs. {pnl_val:,.2f}" if pnl_val >= 0 else f"-Rs. {abs(pnl_val):,.2f}"
+        try:
+            min_unrealized_display = f"-Rs. {abs(float(r.get('min_unrealized_pnl'))):,.2f}"
+        except (TypeError, ValueError):
+            min_unrealized_display = "—"
         dir_val = r.get('direction', '')
         tag_class = "tag-buy" if dir_val == "BULLISH" else ("tag-sell" if dir_val == "BEARISH" else "badge-neutral")
         struct_val = r.get('structure', 'SPREAD').upper()
@@ -1224,6 +1418,7 @@ def build_daybreakout_summary_content(instrument: str = "NIFTY") -> tuple:
           <td class="reason-cell">{trade_rsn}</td>
           <td><span class="status-badge {reason_badge_class}">{reason_label}</span></td>
           <td class="mono pnl-cell {pnl_class}" style="white-space:nowrap;"><strong>{pnl_badge}</strong>&nbsp;<button class="pnl-icon-btn" title="30-min P/L breakdown" onclick="open30MinModal('{r.get('date','')}', '{trade_instr}', '{struct_clean}')">&#128202;</button></td>
+          <td class="mono pnl-cell pnl-negative" style="white-space:nowrap;">{min_unrealized_display}</td>
           <td class="mono premium-cell">{entry_premium_display}</td>
           <td class="mono premium-cell">{exit_premium_display}</td>
         </tr>"""
@@ -1261,6 +1456,7 @@ def build_daybreakout_summary_content(instrument: str = "NIFTY") -> tuple:
             <th class="reason-col">Trade Reason</th>
             <th>Exit Reason</th>
             <th>P&amp;L</th>
+            <th>min_unrealized_pnl</th>
             <th>Entry Premium</th>
             <th>Exit Premium</th>
           </tr>
@@ -1276,6 +1472,499 @@ def build_daybreakout_summary_content(instrument: str = "NIFTY") -> tuple:
             <td class="mono pnl-cell {total_pnl_class}" style="font-size:15px; font-weight:700; padding:12px 14px; background:var(--surface2);">
               {total_pnl_formatted}
             </td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+    """
+    return summary + table_html, total_trades, total_pnl
+
+
+def build_strategy_pnl_data() -> dict:
+    """Aggregate net P&L by instrument and direction from default backtests.
+
+    Position-size variants (for example ``_x0.3``) are skipped to prevent
+    counting the same historical trades multiple times.
+    """
+    result = {}
+    for instrument in ("NIFTY", "SENSEX", "COMBINATION"):
+        candidates = [
+            path for path in DATA_DIR.glob(f"backtest_daybreakout_15m_{instrument}_*_dual.csv")
+            if "_x" not in path.stem.lower()
+        ]
+        candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        totals = {
+            "REVERSE": {"pnl": 0.0, "trades": 0, "daily": {}},
+            "NO-REVERSE": {"pnl": 0.0, "trades": 0, "daily": {}},
+        }
+
+        def add_file(path):
+            try:
+                with path.open(newline="", encoding="utf-8-sig") as stream:
+                    for row in csv.DictReader(stream):
+                        mode = str(row.get("mode", "")).strip().upper()
+                        if mode not in totals:
+                            continue
+                        try:
+                            pnl = float(row.get("pnl", 0) or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        totals[mode]["pnl"] += pnl
+                        totals[mode]["trades"] += 1
+                        trade_date = str(row.get("date", "")).strip()
+                        if trade_date:
+                            daily = totals[mode]["daily"]
+                            daily[trade_date] = daily.get(trade_date, 0.0) + pnl
+            except (OSError, csv.Error):
+                return False
+            return True
+
+        source = None
+        if candidates:
+            chosen = candidates[0]
+            source = chosen.name if add_file(chosen) else None
+        else:
+            # Use separately exported mode files if a merged dual file is absent.
+            mode_files = []
+            for mode_suffix in ("reverse", "no-reverse"):
+                options = [p for p in DATA_DIR.glob(f"backtest_daybreakout_15m_{instrument}_*_{mode_suffix}.csv") if "_x" not in p.stem.lower()]
+                options.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+                if options and add_file(options[0]):
+                    mode_files.append(options[0].name)
+            if not mode_files:
+                # A conventional instrument file may contain only REVERSE results.
+                options = [p for p in DATA_DIR.glob(f"backtest_daybreakout_15m_{instrument}_*.csv") if not any(tag in p.stem.lower() for tag in ("_dual", "_reverse", "_no-reverse", "_x", "comparison"))]
+                options.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+                if options and add_file(options[0]):
+                    mode_files.append(options[0].name)
+            source = ", ".join(mode_files) if mode_files else None
+        result[instrument] = {"source": source, **totals}
+    return result
+
+
+def read_dual_backtest_summary(instrument: str = "COMBINATION") -> tuple:
+    instr = instrument.upper()
+    candidates = [
+        DATA_DIR / f"backtest_daybreakout_15m_{instr}_spread_dual.csv",
+        DATA_DIR / f"backtest_daybreakout_15m_{instr}_naked_dual.csv",
+        DATA_DIR / f"backtest_daybreakout_15m_{instr}_dual.csv",
+    ]
+    extra_matches = [
+        p for p in DATA_DIR.glob(f"backtest_daybreakout_15m_{instr}*dual*.csv")
+    ]
+    all_candidates = []
+    seen = set()
+    for c in candidates + extra_matches:
+        if c not in seen:
+            seen.add(c)
+            all_candidates.append(c)
+
+    # Sort candidates by modification time (most recent first)
+    all_candidates.sort(key=lambda x: x.stat().st_mtime if x.exists() else 0, reverse=True)
+    
+    records = []
+    found_file = f"backtest_daybreakout_15m_{instr}_spread_dual.csv"
+    for csv_file in all_candidates:
+        if csv_file.is_file():
+            found_file = csv_file.name
+            with open(csv_file, mode="r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    try:
+                        row["pnl"] = float(row.get("pnl", 0.0))
+                    except ValueError:
+                        row["pnl"] = 0.0
+                    if "structure" not in row:
+                        row["structure"] = "NAKED" if "_naked" in csv_file.name else "SPREAD"
+                    records.append(row)
+            break
+    return records, found_file
+
+
+def build_dual_backtest_summary_content(instrument: str = "COMBINATION") -> tuple:
+    records, fn = read_dual_backtest_summary(instrument)
+    label = instrument.upper()
+
+    if not records:
+        empty_html = f"""
+        <div class="summary-bar">
+          <span class="s-item"><span class="s-lbl">Status</span><strong>No {label} Dual Backtest Data Found</strong></span>
+          <span class="s-item"><span class="s-lbl">Total Trades</span><strong>0</strong></span>
+          <span class="s-item"><span class="s-lbl">Total Net P&amp;L</span><strong>Rs. 0.00</strong></span>
+        </div>
+        <p class="no-data">No Dual Backtest records found in {fn}. Run backtest_daybreakout_dual.py to generate data.</p>
+        """
+        return empty_html, 0, 0.0
+
+    records.sort(key=lambda row: (
+        str(row.get("date", "")),
+        str(row.get("entry_time", "")),
+        str(row.get("instrument", "")),
+        str(row.get("mode", "")),
+    ))
+
+    total_trades = len(records)
+    total_pnl = sum(r["pnl"] for r in records)
+    wins = sum(1 for r in records if r["pnl"] > 0)
+    losses = sum(1 for r in records if r["pnl"] < 0)
+    win_rate = (wins / total_trades * 100) if total_trades > 0 else 0.0
+    gross_profit = sum(r["pnl"] for r in records if r["pnl"] > 0)
+    gross_loss = sum(abs(r["pnl"]) for r in records if r["pnl"] < 0)
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 0.0
+    avg_pnl = (total_pnl / total_trades) if total_trades > 0 else 0.0
+    avg_win = (gross_profit / wins) if wins > 0 else 0.0
+    avg_loss = (gross_loss / losses) if losses > 0 else 0.0
+    max_profit = max(r["pnl"] for r in records) if records else 0.0
+    max_loss = min(r["pnl"] for r in records) if records else 0.0
+
+    # Calculate daily P&L to get net profit/loss days
+    daily_pnl = {}
+    daily_rev_pnl = {}
+    daily_no_rev_pnl = {}
+    daily_instrument_pnl = {"NIFTY": {}, "SENSEX": {}}
+    for r in records:
+        date = r.get("date", "")
+        mode = r.get("mode", "").upper()
+        pnl = r["pnl"]
+        trade_instrument = str(r.get("instrument", "")).strip().upper()
+        
+        if date not in daily_pnl:
+            daily_pnl[date] = 0.0
+        daily_pnl[date] += pnl
+        
+        if mode == "REVERSE":
+            if date not in daily_rev_pnl:
+                daily_rev_pnl[date] = 0.0
+            daily_rev_pnl[date] += pnl
+        elif mode == "NO-REVERSE":
+            if date not in daily_no_rev_pnl:
+                daily_no_rev_pnl[date] = 0.0
+            daily_no_rev_pnl[date] += pnl
+
+        if trade_instrument in daily_instrument_pnl:
+            instrument_daily = daily_instrument_pnl[trade_instrument]
+            instrument_daily[date] = instrument_daily.get(date, 0.0) + pnl
+
+    instrument_loss_stats = {}
+    instrument_profit_stats = {}
+    for trade_instrument, by_date in daily_instrument_pnl.items():
+        losing_day_values = [pnl for pnl in by_date.values() if pnl < 0]
+        profitable_day_values = [pnl for pnl in by_date.values() if pnl > 0]
+        instrument_loss_stats[trade_instrument] = {
+            "days": len(losing_day_values),
+            "pnl": sum(losing_day_values),
+        }
+        instrument_profit_stats[trade_instrument] = {
+            "days": len(profitable_day_values),
+            "pnl": sum(profitable_day_values),
+        }
+    
+    net_profit_days = sum(1 for pnl in daily_pnl.values() if pnl > 0)
+    net_loss_days = sum(1 for pnl in daily_pnl.values() if pnl < 0)
+    total_days = len(daily_pnl)
+    
+    # Calculate combined daily statistics
+    both_profit_days = 0
+    both_loss_days = 0
+    mixed_profit_days = 0
+    mixed_loss_days = 0
+    both_profit_pnl = 0.0
+    both_loss_pnl = 0.0
+    mixed_profit_pnl = 0.0
+    mixed_loss_pnl = 0.0
+    
+    for date in daily_pnl:
+        rev_pnl = daily_rev_pnl.get(date, 0.0)
+        no_rev_pnl = daily_no_rev_pnl.get(date, 0.0)
+        combined_pnl = daily_pnl[date]
+        
+        if rev_pnl > 0 and no_rev_pnl > 0:
+            both_profit_days += 1
+            both_profit_pnl += combined_pnl
+        elif rev_pnl < 0 and no_rev_pnl < 0:
+            both_loss_days += 1
+            both_loss_pnl += combined_pnl
+        elif combined_pnl > 0:
+            mixed_profit_days += 1
+            mixed_profit_pnl += combined_pnl
+        elif combined_pnl < 0:
+            mixed_loss_days += 1
+            mixed_loss_pnl += combined_pnl
+
+    rev_records = [r for r in records if r.get("mode", "").upper() == "REVERSE"]
+    no_rev_records = [r for r in records if r.get("mode", "").upper() == "NO-REVERSE"]
+    rev_pnl = sum(r["pnl"] for r in rev_records)
+    no_rev_pnl = sum(r["pnl"] for r in no_rev_records)
+    rev_wins = sum(1 for r in rev_records if r["pnl"] > 0)
+    no_rev_wins = sum(1 for r in no_rev_records if r["pnl"] > 0)
+    rev_losses = sum(1 for r in rev_records if r["pnl"] < 0)
+    no_rev_losses = sum(1 for r in no_rev_records if r["pnl"] < 0)
+    rev_avg_pnl = (rev_pnl / len(rev_records)) if rev_records else 0.0
+    no_rev_avg_pnl = (no_rev_pnl / len(no_rev_records)) if no_rev_records else 0.0
+
+    table_rows_html = ""
+    table_day = None
+
+    def append_day_total(day):
+        day_pnl = daily_pnl.get(day, 0.0)
+        day_class = "pnl-positive" if day_pnl >= 0 else "pnl-negative"
+        day_amount = f"+Rs. {day_pnl:,.2f}" if day_pnl >= 0 else f"-Rs. {abs(day_pnl):,.2f}"
+        return f"""
+        <tr class="tfoot-total">
+          <td colspan="12" style="text-align:right; font-weight:700; background:var(--surface2);">DAY TOTAL — {day}</td>
+          <td class="mono pnl-cell {day_class}" style="font-weight:700; background:var(--surface2);">{day_amount}</td>
+          <td style="background:var(--surface2);"></td>
+          <td colspan="2" style="background:var(--surface2);"></td>
+        </tr>"""
+
+    for r in records:
+        record_day = str(r.get("date", ""))
+        if table_day is not None and record_day != table_day:
+            table_rows_html += append_day_total(table_day)
+        table_day = record_day
+
+        pnl_val = r["pnl"]
+        pnl_class = "pnl-positive" if pnl_val >= 0 else "pnl-negative"
+        pnl_badge = f"+Rs. {pnl_val:,.2f}" if pnl_val >= 0 else f"-Rs. {abs(pnl_val):,.2f}"
+        dir_val = r.get('direction', '')
+        tag_class = "tag-buy" if dir_val == "BULLISH" else ("tag-sell" if dir_val == "BEARISH" else "badge-neutral")
+        struct_val = r.get('structure', 'NAKED').upper()
+        struct_clean = struct_val.lower()
+        sell_st = r.get('sell_strike', '')
+        if struct_val == 'NAKED' or sell_st in ('N/A', '', None):
+            strikes_display = f"{r.get('buy_strike', '')} {r.get('opt_type', '')}"
+        else:
+            strikes_display = f"{r.get('buy_strike', '')}/{sell_st} {r.get('opt_type', '')}"
+
+        mode_val = r.get('mode', 'DUAL').upper()
+        try:
+            min_unrealized_display = f"-Rs. {abs(float(r.get('min_unrealized_pnl'))):,.2f}"
+        except (TypeError, ValueError):
+            min_unrealized_display = "—"
+        if mode_val == "REVERSE":
+            mode_badge = '<span style="background:var(--purple-bg); color:var(--purple); border:1px solid var(--purple-border); padding:2px 8px; border-radius:4px; font-size:11px; font-weight:700;">REVERSE</span>'
+        elif mode_val == "NO-REVERSE":
+            mode_badge = '<span style="background:var(--accent-bg); color:var(--accent); border:1px solid var(--border); padding:2px 8px; border-radius:4px; font-size:11px; font-weight:700;">NO-REVERSE</span>'
+        else:
+            mode_badge = f'<span class="badge-neutral">{mode_val}</span>'
+
+        exit_rsn = r.get('exit_reason', '')
+        reason_badge_class = (
+            "badge-success" if "PROFIT" in exit_rsn.upper()
+            else ("badge-danger" if "LOSS" in exit_rsn.upper() else "badge-neutral")
+        )
+        reason_label = exit_rsn.replace("EXIT_", "").replace("_", " ").title()
+        trade_rsn = r.get('trade_reason', '—')
+
+        entry_premium = r.get('entry_premium', '—')
+        exit_premium = r.get('exit_premium', '—')
+        entry_premium_display = f"Rs.{entry_premium}" if entry_premium != '—' else "—"
+        exit_premium_display = f"Rs.{exit_premium}" if exit_premium != '—' else "—"
+
+        expiry_val = r.get('expiry', 'NO')
+        date_display = r.get('date', '')
+        if expiry_val == 'YES':
+            date_display = f'<span class="expiry-date">{date_display}</span>'
+
+        trade_instr = r.get('instrument', 'NIFTY').upper()
+
+        table_rows_html += f"""
+        <tr>
+          <td>{date_display}</td>
+          <td class="mono"><strong>{trade_instr}</strong></td>
+          <td>{mode_badge}</td>
+          <td class="mono"><strong>{struct_val}</strong></td>
+          <td class="mono">{r.get('gap_direction', '')} ({r.get('gap_size', '')})</td>
+          <td class="mono">{r.get('trade_type', '')}</td>
+          <td><span class="{tag_class}">{dir_val}</span></td>
+          <td class="mono">{r.get('entry_time', '')} @ {r.get('entry_spot', '')}</td>
+          <td class="mono">{strikes_display}</td>
+          <td class="mono">{r.get('exit_time', '')} @ {r.get('exit_spot', '')}</td>
+          <td class="reason-cell">{trade_rsn}</td>
+          <td><span class="status-badge {reason_badge_class}">{reason_label}</span></td>
+          <td class="mono pnl-cell {pnl_class}" style="white-space:nowrap;"><strong>{pnl_badge}</strong>&nbsp;<button class="pnl-icon-btn" title="30-min P/L breakdown" onclick="open30MinModal('{r.get('date','')}', '{trade_instr}', '{struct_clean}')">&#128202;</button></td>
+          <td class="mono pnl-cell pnl-negative" style="white-space:nowrap;">{min_unrealized_display}</td>
+          <td class="mono premium-cell">{entry_premium_display}</td>
+          <td class="mono premium-cell">{exit_premium_display}</td>
+        </tr>"""
+
+    if table_day is not None:
+        table_rows_html += append_day_total(table_day)
+
+    total_pnl_class = "pnl-positive" if total_pnl >= 0 else "pnl-negative"
+    total_pnl_formatted = f"+Rs. {total_pnl:,.2f}" if total_pnl >= 0 else f"-Rs. {abs(total_pnl):,.2f}"
+    rev_pnl_formatted = f"+Rs. {rev_pnl:,.2f}" if rev_pnl >= 0 else f"-Rs. {abs(rev_pnl):,.2f}"
+    no_rev_pnl_formatted = f"+Rs. {no_rev_pnl:,.2f}" if no_rev_pnl >= 0 else f"-Rs. {abs(no_rev_pnl):,.2f}"
+    rev_avg_formatted = f"+Rs. {rev_avg_pnl:,.2f}" if rev_avg_pnl >= 0 else f"-Rs. {abs(rev_avg_pnl):,.2f}"
+    no_rev_avg_formatted = f"+Rs. {no_rev_avg_pnl:,.2f}" if no_rev_avg_pnl >= 0 else f"-Rs. {abs(no_rev_avg_pnl):,.2f}"
+    
+    avg_win_formatted = f"+Rs. {avg_win:,.2f}" if avg_win >= 0 else f"-Rs. {abs(avg_win):,.2f}"
+    avg_loss_formatted = f"-Rs. {abs(avg_loss):,.2f}"
+    max_profit_formatted = f"+Rs. {max_profit:,.2f}" if max_profit >= 0 else f"-Rs. {abs(max_profit):,.2f}"
+    max_loss_formatted = f"-Rs. {abs(max_loss):,.2f}"
+    daily_avg_pnl = (total_pnl / total_days) if total_days > 0 else 0.0
+    daily_avg_formatted = f"+Rs. {daily_avg_pnl:,.2f}" if daily_avg_pnl >= 0 else f"-Rs. {abs(daily_avg_pnl):,.2f}"
+    
+    both_profit_pnl_formatted = f"+Rs. {both_profit_pnl:,.2f}" if both_profit_pnl >= 0 else f"-Rs. {abs(both_profit_pnl):,.2f}"
+    both_loss_pnl_formatted = f"-Rs. {abs(both_loss_pnl):,.2f}"
+    mixed_profit_pnl_formatted = f"+Rs. {mixed_profit_pnl:,.2f}" if mixed_profit_pnl >= 0 else f"-Rs. {abs(mixed_profit_pnl):,.2f}"
+    mixed_loss_pnl_formatted = f"-Rs. {abs(mixed_loss_pnl):,.2f}"
+    nifty_loss_days = instrument_loss_stats["NIFTY"]["days"]
+    nifty_loss_pnl = instrument_loss_stats["NIFTY"]["pnl"]
+    sensex_loss_days = instrument_loss_stats["SENSEX"]["days"]
+    sensex_loss_pnl = instrument_loss_stats["SENSEX"]["pnl"]
+    nifty_profit_days = instrument_profit_stats["NIFTY"]["days"]
+    nifty_profit_pnl = instrument_profit_stats["NIFTY"]["pnl"]
+    sensex_profit_days = instrument_profit_stats["SENSEX"]["days"]
+    sensex_profit_pnl = instrument_profit_stats["SENSEX"]["pnl"]
+    nifty_loss_pnl_formatted = f"-Rs. {abs(nifty_loss_pnl):,.2f}" if nifty_loss_pnl < 0 else "Rs. 0.00"
+    sensex_loss_pnl_formatted = f"-Rs. {abs(sensex_loss_pnl):,.2f}" if sensex_loss_pnl < 0 else "Rs. 0.00"
+    nifty_profit_pnl_formatted = f"+Rs. {nifty_profit_pnl:,.2f}" if nifty_profit_pnl > 0 else "Rs. 0.00"
+    sensex_profit_pnl_formatted = f"+Rs. {sensex_profit_pnl:,.2f}" if sensex_profit_pnl > 0 else "Rs. 0.00"
+
+    summary = f"""
+    <div style="background:#ffffff; border:1px solid var(--border); border-radius:8px; padding:16px 20px; margin-bottom:16px; box-shadow:var(--shadow);">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; border-bottom:1px solid var(--border-light); padding-bottom:10px;">
+        <div>
+          <span style="font-size:17px; font-weight:700; color:var(--text);">&#127919; DUAL STRATEGY OVERALL NET RESULT</span>
+          <span style="font-size:12px; color:var(--text-muted); margin-left:8px;">(Executing Both REVERSE &amp; NO-REVERSE Trades at a Time)</span>
+        </div>
+        <div style="font-size:12px; color:var(--text-muted);">Source: <strong>{fn}</strong></div>
+      </div>
+      
+      <!-- Primary Metrics -->
+      <div class="summary-bar" style="margin-bottom:10px; background:var(--surface2);">
+        <span class="s-item"><span class="s-lbl">Total Trades</span><strong>{total_trades}</strong></span>
+        <span class="s-item"><span class="s-lbl">Win Rate</span><strong>{win_rate:.1f}% ({wins}W / {losses}L)</strong></span>
+        <span class="s-item"><span class="s-lbl">Gross Profit</span><strong style="color:var(--green);">+Rs. {gross_profit:,.2f}</strong></span>
+        <span class="s-item"><span class="s-lbl">Gross Loss</span><strong style="color:var(--red);">-Rs. {gross_loss:,.2f}</strong></span>
+        <span class="s-item"><span class="s-lbl">Profit Factor</span><strong>{profit_factor:.2f}</strong></span>
+        <span class="s-item"><span class="s-lbl">Avg / Trade</span><strong>Rs. {'+' if avg_pnl >= 0 else '-'}{abs(avg_pnl):,.2f}</strong></span>
+        <span class="s-item"><span class="s-lbl">OVERALL NET P&amp;L</span><strong class="{total_pnl_class}" style="font-size:18px;">{total_pnl_formatted}</strong></span>
+      </div>
+      
+      <!-- Detailed Statistics -->
+      <div class="summary-bar" style="margin-bottom:10px; background:var(--bg);">
+        <span class="s-item"><span class="s-lbl">Avg Win</span><strong style="color:var(--green);">{avg_win_formatted}</strong></span>
+        <span class="s-item"><span class="s-lbl">Avg Loss</span><strong style="color:var(--red);">{avg_loss_formatted}</strong></span>
+        <span class="s-item"><span class="s-lbl">Max Profit</span><strong style="color:var(--green);">{max_profit_formatted}</strong></span>
+        <span class="s-item"><span class="s-lbl">Max Loss</span><strong style="color:var(--red);">{max_loss_formatted}</strong></span>
+        <span class="s-item"><span class="s-lbl">Total Days</span><strong>{total_days}</strong></span>
+        <span class="s-item"><span class="s-lbl">Net Profit Days</span><strong style="color:var(--green);">{net_profit_days}</strong></span>
+        <span class="s-item"><span class="s-lbl">Net Loss Days</span><strong style="color:var(--red);">{net_loss_days}</strong></span>
+        <span class="s-item"><span class="s-lbl">Daily Avg P&amp;L</span><strong>{daily_avg_formatted}</strong></span>
+      </div>
+      
+      <!-- Combined Strategy Day Analysis -->
+      <div style="background:var(--surface2); border:1px solid var(--border); border-radius:8px; padding:12px 16px; margin-bottom:10px;">
+        <div style="font-size:13px; font-weight:700; color:var(--text); margin-bottom:10px; border-bottom:1px solid var(--border-light); padding-bottom:8px;">
+          &#128200; COMBINED STRATEGY DAY ANALYSIS (Both Legs Together)
+        </div>
+        <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:12px; font-size:12px;">
+          <div style="background:var(--green-bg); border:1px solid var(--green-border); padding:8px 12px; border-radius:6px;">
+            <div style="color:var(--green); font-weight:700; font-size:11px; margin-bottom:4px;">BOTH PROFIT DAYS</div>
+            <div style="font-size:18px; font-weight:700; color:var(--text);">{both_profit_days}</div>
+            <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">{both_profit_pnl_formatted}</div>
+          </div>
+          <div style="background:var(--red-bg); border:1px solid var(--red-border); padding:8px 12px; border-radius:6px;">
+            <div style="color:var(--red); font-weight:700; font-size:11px; margin-bottom:4px;">BOTH LOSS DAYS</div>
+            <div style="font-size:18px; font-weight:700; color:var(--text);">{both_loss_days}</div>
+            <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">{both_loss_pnl_formatted}</div>
+          </div>
+          <div style="background:var(--accent-bg); border:1px solid var(--border); padding:8px 12px; border-radius:6px;">
+            <div style="color:var(--accent); font-weight:700; font-size:11px; margin-bottom:4px;">MIXED PROFIT DAYS</div>
+            <div style="font-size:18px; font-weight:700; color:var(--text);">{mixed_profit_days}</div>
+            <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">{mixed_profit_pnl_formatted}</div>
+          </div>
+          <div style="background:var(--purple-bg); border:1px solid var(--purple-border); padding:8px 12px; border-radius:6px;">
+            <div style="color:var(--purple); font-weight:700; font-size:11px; margin-bottom:4px;">MIXED LOSS DAYS</div>
+            <div style="font-size:18px; font-weight:700; color:var(--text);">{mixed_loss_days}</div>
+            <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">{mixed_loss_pnl_formatted}</div>
+          </div>
+          <div style="background:var(--red-bg); border:1px solid var(--red-border); padding:8px 12px; border-radius:6px;">
+            <div style="color:var(--red); font-weight:700; font-size:11px; margin-bottom:4px;">NIFTY LOSS DAYS</div>
+            <div style="font-size:18px; font-weight:700; color:var(--text);">{nifty_loss_days}</div>
+            <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">{nifty_loss_pnl_formatted}</div>
+          </div>
+          <div style="background:var(--red-bg); border:1px solid var(--red-border); padding:8px 12px; border-radius:6px;">
+            <div style="color:var(--red); font-weight:700; font-size:11px; margin-bottom:4px;">SENSEX LOSS DAYS</div>
+            <div style="font-size:18px; font-weight:700; color:var(--text);">{sensex_loss_days}</div>
+            <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">{sensex_loss_pnl_formatted}</div>
+          </div>
+          <div style="background:var(--green-bg); border:1px solid var(--green-border); padding:8px 12px; border-radius:6px;">
+            <div style="color:var(--green); font-weight:700; font-size:11px; margin-bottom:4px;">NIFTY PROFIT DAYS</div>
+            <div style="font-size:18px; font-weight:700; color:var(--text);">{nifty_profit_days}</div>
+            <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">{nifty_profit_pnl_formatted}</div>
+          </div>
+          <div style="background:var(--green-bg); border:1px solid var(--green-border); padding:8px 12px; border-radius:6px;">
+            <div style="color:var(--green); font-weight:700; font-size:11px; margin-bottom:4px;">SENSEX PROFIT DAYS</div>
+            <div style="font-size:18px; font-weight:700; color:var(--text);">{sensex_profit_days}</div>
+            <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">{sensex_profit_pnl_formatted}</div>
+          </div>
+        </div>
+        <div style="font-size:11px; color:var(--text-muted); margin-top:8px; text-align:center;">
+          Instrument loss days count a day when that instrument’s NIFTY or SENSEX trades combined across both modes have negative net P&amp;L. <strong>BOTH PROFIT:</strong> Both strategies profitable | <strong>BOTH LOSS:</strong> Both strategies loss-making | <strong>MIXED:</strong> One profit, one loss (combined net shown)
+        </div>
+      </div>
+      
+      <!-- Mode Breakdown -->
+      <div style="display:flex; gap:16px; font-size:12px;">
+        <div style="flex:1; background:var(--purple-bg); border:1px solid var(--purple-border); padding:8px 14px; border-radius:6px;">
+          <strong style="color:var(--purple); font-size:13px;">REVERSE Leg (Fade):</strong>
+          <div style="margin-top:4px;">
+            <span style="display:block;">{len(rev_records)} trades ({rev_wins}W / {rev_losses}L)</span>
+            <span style="display:block;">Net P&amp;L: <strong>{rev_pnl_formatted}</strong></span>
+            <span style="display:block;">Avg / Trade: <strong>{rev_avg_formatted}</strong></span>
+          </div>
+        </div>
+        <div style="flex:1; background:var(--accent-bg); border:1px solid var(--border); padding:8px 14px; border-radius:6px;">
+          <strong style="color:var(--accent); font-size:13px;">NO-REVERSE Leg (Follow):</strong>
+          <div style="margin-top:4px;">
+            <span style="display:block;">{len(no_rev_records)} trades ({no_rev_wins}W / {no_rev_losses}L)</span>
+            <span style="display:block;">Net P&amp;L: <strong>{no_rev_pnl_formatted}</strong></span>
+            <span style="display:block;">Avg / Trade: <strong>{no_rev_avg_formatted}</strong></span>
+          </div>
+        </div>
+      </div>
+    </div>"""
+
+    table_html = f"""
+    <div class="dual-backtest-scroll-top" aria-label="Scroll dual backtest table horizontally"><div></div></div>
+    <div class="table-wrap dual-backtest-table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>Instrument</th>
+            <th>Mode</th>
+            <th>Structure</th>
+            <th>Gap</th>
+            <th>Trade Type</th>
+            <th>Direction</th>
+            <th>Entry</th>
+            <th>Strikes</th>
+            <th>Exit</th>
+            <th class="reason-col">Trade Reason</th>
+            <th>Exit Reason</th>
+            <th>P&amp;L</th>
+            <th>min_unrealized_pnl</th>
+            <th>Entry Premium</th>
+            <th>Exit Premium</th>
+          </tr>
+        </thead>
+        <tbody>
+          {table_rows_html}
+        </tbody>
+        <tfoot>
+          <tr class="tfoot-total">
+            <td colspan="12" style="text-align:right; font-weight:700; font-size:13px; padding:12px 14px; background:var(--surface2);">
+              OVERALL DUAL NET P&amp;L ({total_trades} trades from both legs):
+            </td>
+            <td class="mono pnl-cell {total_pnl_class}" style="font-size:16px; font-weight:700; padding:12px 14px; background:var(--surface2);">
+              {total_pnl_formatted}
+            </td>
+            <td style="background:var(--surface2);"></td>
+            <td colspan="2" style="background:var(--surface2);"></td>
           </tr>
         </tfoot>
       </table>
@@ -1414,7 +2103,21 @@ def build_page(selected_date: str = None, selected_slot: str = SLOT_ALL,
       {log_pane_html}
     </div>"""
 
-    # Modal summaries for both instruments
+    # ── 5. Dual Backtest Tab (Both Trades at a Time) ──
+    dual_backtest_html, dual_backtest_count, _ = build_dual_backtest_summary_content("COMBINATION")
+    strategy_pnl_json = json.dumps(build_strategy_pnl_data(), ensure_ascii=False).replace("</", "<\\/")
+    all_tabs_btn += f"""
+    <button class="tab-btn" data-target="dual-backtest-tab" onclick="switchTab(this)">
+      🎯 Dual Backtest
+      <span class="tab-pill" style="background:var(--purple-bg); border-color:var(--purple-border); color:var(--purple); font-weight:700;">{dual_backtest_count}</span>
+    </button>"""
+
+    all_tabs_pane += f"""
+    <div id="dual-backtest-tab" class="tab-pane">
+      {dual_backtest_html}
+    </div>"""
+
+    # Modal summaries for instruments
     bn_summary_html, bn_summary_count, _ = build_trades_summary_content(INSTR_BN)
     sx_summary_html, sx_summary_count, _ = build_trades_summary_content(INSTR_SX)
 
@@ -1646,16 +2349,16 @@ def build_page(selected_date: str = None, selected_slot: str = SLOT_ALL,
   .modal-overlay {{
     display: none; position: fixed; inset: 0;
     background: rgba(15,23,42,0.45); z-index: 1000;
-    align-items: center; justify-content: center;
-    padding: 10vh 10vw;
+    align-items: stretch; justify-content: stretch;
+    padding: 0;
   }}
   .modal-overlay.show {{ display: flex; }}
   .modal-box {{
-    width: 90vw;
-    max-height: 90vh;
+    width: 100vw; height: 100vh;
+    max-width: 100vw; max-height: 100vh;
     background: var(--surface);
     border: 1px solid var(--border);
-    border-radius: 12px;
+    border-radius: 0;
     box-shadow: 0 20px 50px rgba(0,0,0,0.22);
     display: flex;
     flex-direction: column;
@@ -1681,8 +2384,20 @@ def build_page(selected_date: str = None, selected_slot: str = SLOT_ALL,
   }}
   .modal-close:hover {{ color: var(--red); }}
   .modal-body {{
-    flex: 1; overflow-y: auto; padding: 16px 20px 24px; background: var(--bg);
+    flex: 1; min-height: 0; overflow-x: auto; overflow-y: auto; padding: 20px; background: var(--bg);
   }}
+  #dual-backtest-summary-modal {{ padding: 0; align-items: stretch; justify-content: stretch; }}
+  #dual-backtest-summary-modal .modal-box {{
+    width: 100vw; height: 100vh; max-width: 100vw; max-height: 100vh;
+    border-radius: 0; display: flex; flex-direction: column;
+  }}
+  #dual-backtest-summary-modal .modal-body {{ min-height: 0; padding: 12px; }}
+  .modal-scroll-top, .dual-backtest-scroll-top {{
+    position: sticky; top: 0; z-index: 20;
+    height: 16px; overflow-x: auto; overflow-y: hidden; margin: 0 0 4px;
+    background: var(--surface); scrollbar-width: auto;
+  }}
+  .modal-scroll-top > div, .dual-backtest-scroll-top > div {{ height: 1px; }}
   .modal-body .summary-bar {{ margin-bottom: 16px; }}
   .date-group-cell {{
     vertical-align: middle; font-weight: 600;
@@ -1715,7 +2430,7 @@ def build_page(selected_date: str = None, selected_slot: str = SLOT_ALL,
   /* ── TABLE WRAPPER ── */
   .table-wrap {{
     border: 1px solid var(--border); border-radius: var(--radius);
-    box-shadow: var(--shadow); overflow: hidden; background: var(--surface);
+    box-shadow: var(--shadow); overflow-x: auto; overflow-y: visible; background: var(--surface);
   }}
   .table-wrap table {{
     width: 100%; border-collapse: separate; border-spacing: 0;
@@ -1805,8 +2520,8 @@ def build_page(selected_date: str = None, selected_slot: str = SLOT_ALL,
     <div class="live-indicator"><div class="live-dot"></div> Live</div>
     <div class="updated-label">Updated: <strong>{now_str}</strong></div>
     <button class="btn-refresh" onclick="location.reload()">&#8635; Refresh Now</button>
-    <button class="btn-summary" onclick="openTradesSummary('BANKNIFTY')">&#128202; BankNifty Summary</button>
-    <button class="btn-summary" onclick="openTradesSummary('SENSEX')">&#128202; SENSEX Summary</button>
+    <button class="btn-summary" onclick="openDualBacktestSummary()" style="background:#7e22ce; color:#ffffff; border-color:#d8b4fe; font-weight:700; box-shadow:0 1px 4px rgba(126,34,206,0.35);">&#127919; Dual Backtest Summary</button>
+    <button class="btn-summary" onclick="openStrategyPnlGraph()" style="background:#0f766e; color:#ffffff; border-color:#5eead4; font-weight:700;">&#128200; Strategy P&amp;L Graph</button>
     <!-- Day‑Breakout summary buttons -->
     <button class="btn-summary" onclick="openDayBreakoutSummary('NIFTY')">&#128202; Day‑Breakout NIFTY</button>
     <button class="btn-summary" onclick="openDayBreakoutSummary('SENSEX')">&#128202; Day‑Breakout SENSEX</button>
@@ -1941,9 +2656,39 @@ def build_page(selected_date: str = None, selected_slot: str = SLOT_ALL,
       </div>
     </div>
 
+    <!-- Dual Backtest Summary Modal -->
+    <div id="dual-backtest-summary-modal" class="modal-overlay" onclick="closeDualBacktestSummaryOnBackdrop(event)">
+      <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="dual-backtest-summary-title" style="max-width:100vw; width:100vw;">
+        <div class="modal-header">
+          <h2 id="dual-backtest-summary-title">
+            🎯 Dual Strategy Backtest (Both Trades at a Time &mdash; Nearest Expiry Combination)
+            <span class="modal-badge">{dual_backtest_count} trades</span>
+          </h2>
+          <button type="button" class="modal-close" onclick="closeDualBacktestSummary()" aria-label="Close">&times;</button>
+        </div>
+        <div class="modal-body">
+          {dual_backtest_html}
+        </div>
+      </div>
+    </div>
+
+    <div id="strategy-pnl-modal" class="modal-overlay" onclick="closeStrategyPnlGraphOnBackdrop(event)" style="padding:0;">
+      <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="strategy-pnl-title" style="width:100vw;height:100vh;max-width:none;max-height:none;border-radius:0;">
+        <div class="modal-header">
+          <h2 id="strategy-pnl-title">Strategy P&amp;L Comparison · Backtest</h2>
+          <button type="button" class="modal-close" onclick="closeStrategyPnlGraph()" aria-label="Close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <p class="no-data" style="margin-top:0;">Cumulative realized P&amp;L by trade date. Each line aggregates that strategy’s P&amp;L from the first backtest date onward. Solid = REVERSE; dashed = NO-REVERSE.</p>
+          <div id="strategy-pnl-chart-wrap" style="position:relative;width:100%;height:calc(100vh - 230px);min-height:280px;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px;"><canvas id="strategy-pnl-canvas" style="width:100%;height:100%;"></canvas><div id="strategy-pnl-tooltip" style="display:none;position:absolute;z-index:5;pointer-events:none;padding:9px 11px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);box-shadow:0 8px 24px rgba(0,0,0,.35);font:12px system-ui;white-space:nowrap;"></div></div>
+          <div id="strategy-pnl-sources" class="summary-bar" style="margin-top:14px;"></div>
+        </div>
+      </div>
+    </div>
+
     <!-- 30-Min Breakdown Modal -->
     <div id="breakdown-30min-modal" class="modal-overlay" onclick="close30MinModalOnBackdrop(event)">
-      <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="breakdown-30min-title" style="max-width:560px;">
+      <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="breakdown-30min-title" style="max-width:100vw; width:100vw;">
         <div class="modal-header">
           <h2 id="breakdown-30min-title">30-Min P/L Breakdown</h2>
           <button type="button" class="modal-close" onclick="close30MinModal()" aria-label="Close">&times;</button>
@@ -1955,6 +2700,169 @@ def build_page(selected_date: str = None, selected_slot: str = SLOT_ALL,
     </div>
 
 <script>
+  const strategyPnlData = {strategy_pnl_json};
+  let strategyPnlSegments = [];
+
+  function drawStrategyPnlGraph() {{
+    const canvas = document.getElementById('strategy-pnl-canvas');
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = rect.width * dpr; canvas.height = rect.height * dpr;
+    const ctx = canvas.getContext('2d'); ctx.scale(dpr, dpr);
+    strategyPnlSegments = [];
+    const w = rect.width, h = rect.height;
+    ctx.clearRect(0, 0, w, h);
+    const palette = {{
+      'NIFTY REVERSE': '#a855f7', 'NIFTY NO-REVERSE': '#d8b4fe',
+      'SENSEX REVERSE': '#06b6d4', 'SENSEX NO-REVERSE': '#67e8f9',
+      'COMBINATION REVERSE': '#f59e0b', 'COMBINATION NO-REVERSE': '#ec4899'
+    }};
+    const instruments = ['NIFTY', 'SENSEX', 'COMBINATION'];
+    const modes = ['REVERSE', 'NO-REVERSE'];
+    const dates = [...new Set(instruments.flatMap(i => modes.flatMap(m => Object.keys(strategyPnlData[i][m].daily))))].sort();
+    const series = [];
+    instruments.forEach(instrument => modes.forEach(mode => {{
+      const raw = strategyPnlData[instrument][mode].daily;
+      let runningTotal = 0, started = false;
+      const cumulative = {{}};
+      dates.forEach(date => {{
+        if (date in raw) {{ runningTotal += Number(raw[date]); started = true; }}
+        if (started) cumulative[date] = runningTotal;
+      }});
+      if (started) series.push({{
+        label: `${{instrument}} ${{mode}}`, color: palette[`${{instrument}} ${{mode}}`], mode,
+        values: cumulative, source: strategyPnlData[instrument].source
+      }});
+    }}));
+    const sources = document.getElementById('strategy-pnl-sources');
+    if (!dates.length) {{
+      ctx.fillStyle = '#94a3b8'; ctx.font = '14px system-ui'; ctx.textAlign = 'center';
+      ctx.fillText('No dated backtest P&L data found', w / 2, h / 2);
+      sources.innerHTML = '<span class="muted">No matching backtest CSV files.</span>';
+      return;
+    }}
+    const allValues = series.flatMap(s => Object.values(s.values).map(Number));
+    let minY = Math.min(0, ...allValues), maxY = Math.max(0, ...allValues);
+    const padding = (maxY - minY) * 0.10 || 1; minY -= padding; maxY += padding;
+    const pad = {{ left: 76, right: 20, top: 24, bottom: 54 }};
+    const plotW = w - pad.left - pad.right, plotH = h - pad.top - pad.bottom;
+    const x = i => pad.left + (dates.length === 1 ? plotW / 2 : i * plotW / (dates.length - 1));
+    const y = value => pad.top + (maxY - value) * plotH / (maxY - minY);
+    ctx.font = '10px system-ui'; ctx.textAlign = 'right'; ctx.fillStyle = '#94a3b8';
+    for (let i = 0; i <= 4; i++) {{
+      const value = maxY - i * (maxY - minY) / 4, yy = y(value);
+      ctx.strokeStyle = value === 0 ? '#94a3b8' : '#334155'; ctx.lineWidth = value === 0 ? 1.5 : 1;
+      ctx.beginPath(); ctx.moveTo(pad.left, yy); ctx.lineTo(w - pad.right, yy); ctx.stroke();
+      ctx.fillText(value.toLocaleString('en-IN', {{ maximumFractionDigits: 0 }}), pad.left - 8, yy + 3);
+    }}
+    const tickCount = Math.min(10, dates.length), tickIndices = new Set(Array.from({{length: tickCount}}, (_, i) => Math.round(i * (dates.length - 1) / Math.max(1, tickCount - 1))));
+    ctx.textAlign = 'center';
+    tickIndices.forEach(i => ctx.fillText(dates[i].slice(5), x(i), h - pad.bottom + 18));
+    series.forEach(s => {{
+      ctx.strokeStyle = s.color; ctx.fillStyle = s.color;
+      ctx.lineWidth = s.label.startsWith('COMBINATION') ? 3.5 : 2;
+      ctx.setLineDash(s.mode === 'NO-REVERSE' ? [6, 4] : []);
+      let started = false;
+      let previous = null;
+      ctx.beginPath();
+      dates.forEach((date, i) => {{
+        if (!(date in s.values)) {{ if (started) ctx.stroke(); started = false; return; }}
+        const px = x(i), py = y(Number(s.values[date]));
+        const point = {{ x: px, y: py, value: Number(s.values[date]), date }};
+        if (previous) strategyPnlSegments.push({{ x1: previous.x, y1: previous.y, v1: previous.value, d1: previous.date, x2: px, y2: py, v2: point.value, d2: date, label: s.label, color: s.color }});
+        else if (dates.length === 1) strategyPnlSegments.push({{ x1: px, y1: py, v1: point.value, d1: date, x2: px, y2: py, v2: point.value, d2: date, label: s.label, color: s.color }});
+        if (!started) {{ ctx.beginPath(); ctx.moveTo(px, py); started = true; }}
+        else ctx.lineTo(px, py);
+        previous = point;
+      }});
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }});
+    sources.innerHTML = series.map(s => {{
+      const lastDate = dates[dates.length - 1], lastValue = s.values[lastDate];
+      return `<span class="s-item"><strong style="color:${{s.color}}">${{s.label}}</strong><span class="s-lbl">Latest cumulative: Rs. ${{Number(lastValue).toLocaleString('en-IN', {{minimumFractionDigits:2, maximumFractionDigits:2}})}}</span><span class="s-lbl">${{s.source || 'No source file'}}</span></span>`;
+    }}).join('');
+    canvas.onmousemove = event => {{
+      const bounds = canvas.getBoundingClientRect(), mx = event.clientX - bounds.left, my = event.clientY - bounds.top;
+      let closest = null, closestDistance = Infinity;
+      strategyPnlSegments.forEach(segment => {{
+        const dx = segment.x2 - segment.x1, dy = segment.y2 - segment.y1;
+        const lengthSq = dx * dx + dy * dy;
+        const t = lengthSq ? Math.max(0, Math.min(1, ((mx - segment.x1) * dx + (my - segment.y1) * dy) / lengthSq)) : 0;
+        const px = segment.x1 + t * dx, py = segment.y1 + t * dy;
+        const distance = Math.hypot(mx - px, my - py);
+        if (distance < closestDistance) {{ closestDistance = distance; closest = {{ segment, t, px, py }}; }}
+      }});
+      const tooltip = document.getElementById('strategy-pnl-tooltip');
+      if (!closest || closestDistance > 16) {{ tooltip.style.display = 'none'; return; }}
+      const {{ segment, t }} = closest;
+      const value = segment.v1 + (segment.v2 - segment.v1) * t;
+      const dateLabel = segment.d1 === segment.d2 ? segment.d1 : `${{segment.d1}} → ${{segment.d2}}`;
+      tooltip.innerHTML = `<strong style="color:${{segment.color}}">${{segment.label}}</strong><br>${{dateLabel}}<br>Cumulative P&amp;L: Rs. ${{value.toLocaleString('en-IN', {{minimumFractionDigits:2, maximumFractionDigits:2}})}}`;
+      tooltip.style.display = 'block';
+      tooltip.style.left = Math.min(mx + 14, bounds.width - tooltip.offsetWidth - 8) + 'px';
+      tooltip.style.top = Math.max(8, Math.min(my + 14, bounds.height - tooltip.offsetHeight - 8)) + 'px';
+    }};
+    canvas.onmouseleave = () => {{ document.getElementById('strategy-pnl-tooltip').style.display = 'none'; }};
+  }}
+
+  function openStrategyPnlGraph() {{
+    const modal = document.getElementById('strategy-pnl-modal');
+    if (modal) modal.classList.add('show');
+    document.body.style.overflow = 'hidden';
+    const url = new URL(window.location.href);
+    url.searchParams.set('tab', 'strategy-pnl');
+    history.replaceState(null, '', url.toString());
+    requestAnimationFrame(drawStrategyPnlGraph);
+  }}
+  function closeStrategyPnlGraph() {{
+    const modal = document.getElementById('strategy-pnl-modal');
+    if (modal) modal.classList.remove('show');
+    document.body.style.overflow = '';
+    const url = new URL(window.location.href); url.searchParams.delete('tab');
+    history.replaceState(null, '', url.toString());
+  }}
+  function closeStrategyPnlGraphOnBackdrop(event) {{
+    if (event.target.id === 'strategy-pnl-modal') closeStrategyPnlGraph();
+  }}
+  window.addEventListener('resize', () => {{
+    if (document.getElementById('strategy-pnl-modal').classList.contains('show')) drawStrategyPnlGraph();
+  }});
+
+  function syncModalTableScrollbars(modal) {{
+    if (!modal) return;
+    modal.querySelectorAll('.modal-body table').forEach(table => {{
+      const wrap = table.closest('.table-wrap');
+      if (!wrap) return;
+      let top = wrap.previousElementSibling;
+      if (!top || (!top.classList.contains('modal-scroll-top') && !top.classList.contains('dual-backtest-scroll-top'))) {{
+        top = document.createElement('div');
+        top.className = 'modal-scroll-top';
+        top.setAttribute('aria-label', 'Scroll table horizontally');
+        top.innerHTML = '<div></div>';
+        wrap.parentNode.insertBefore(top, wrap);
+      }}
+      const spacer = top.firstElementChild;
+      if (!spacer) return;
+      const updateWidth = () => {{ spacer.style.width = `${{wrap.scrollWidth}}px`; }};
+      updateWidth();
+      if (top.dataset.synced === 'true') return;
+      top.dataset.synced = 'true';
+      let syncing = false;
+      top.addEventListener('scroll', () => {{
+        if (syncing) return;
+        syncing = true; wrap.scrollLeft = top.scrollLeft; syncing = false;
+      }});
+      wrap.addEventListener('scroll', () => {{
+        if (syncing) return;
+        syncing = true; top.scrollLeft = wrap.scrollLeft; syncing = false;
+      }});
+      window.addEventListener('resize', updateWidth);
+    }});
+  }}
+
   function open30MinModal(date, instrument, structure) {{
     const modal = document.getElementById('breakdown-30min-modal');
     const titleEl = document.getElementById('breakdown-30min-title');
@@ -1998,7 +2906,8 @@ def build_page(selected_date: str = None, selected_slot: str = SLOT_ALL,
         tableHTML += '<td class="' + totClass + '" style="padding:10px 14px;text-align:right;font-family:monospace;font-weight:700;font-size:15px;">' + totFmt + '</td>';
         tableHTML += '</tr>';
         tableHTML += '</tbody></table>';
-        bodyEl.innerHTML = tableHTML;
+        bodyEl.innerHTML = '<div class="table-wrap">' + tableHTML + '</div>';
+        requestAnimationFrame(() => syncModalTableScrollbars(modal));
       }})
       .catch(err => {{ bodyEl.innerHTML = '<p class="no-data" style="color:var(--red);">&#9888; ' + err + '</p>'; }});
   }}
@@ -2025,6 +2934,7 @@ def build_page(selected_date: str = None, selected_slot: str = SLOT_ALL,
     const modalId = instrument === 'SENSEX' ? 'trades-summary-modal-sx' : 'trades-summary-modal-bn';
     const modal = document.getElementById(modalId);
     if (modal) modal.classList.add('show');
+    requestAnimationFrame(() => syncModalTableScrollbars(modal));
     document.body.style.overflow = 'hidden';
     const url = new URL(window.location.href);
     url.searchParams.set('tab', 'summary');
@@ -2054,6 +2964,7 @@ def build_page(selected_date: str = None, selected_slot: str = SLOT_ALL,
     else if (instrument === 'COMBINATION') modalId = 'daybreakout-summary-modal-comb';
     const modal = document.getElementById(modalId);
     if (modal) modal.classList.add('show');
+    requestAnimationFrame(() => syncModalTableScrollbars(modal));
     document.body.style.overflow = 'hidden';
     const url = new URL(window.location.href);
     url.searchParams.set('tab', 'daybreakout');
@@ -2084,6 +2995,7 @@ def build_page(selected_date: str = None, selected_slot: str = SLOT_ALL,
   function open3LegSummary() {{
     const modal = document.getElementById('threeleg-summary-modal');
     if (modal) modal.classList.add('show');
+    requestAnimationFrame(() => syncModalTableScrollbars(modal));
     document.body.style.overflow = 'hidden';
     const url = new URL(window.location.href);
     url.searchParams.set('tab', 'threeleg');
@@ -2103,6 +3015,29 @@ def build_page(selected_date: str = None, selected_slot: str = SLOT_ALL,
     if (event.target.id === 'threeleg-summary-modal') close3LegSummary();
   }}
 
+  function openDualBacktestSummary() {{
+    const modal = document.getElementById('dual-backtest-summary-modal');
+    if (modal) modal.classList.add('show');
+    requestAnimationFrame(() => syncModalTableScrollbars(modal));
+    document.body.style.overflow = 'hidden';
+    const url = new URL(window.location.href);
+    url.searchParams.set('tab', 'dual-backtest');
+    history.replaceState(null, '', url.toString());
+  }}
+
+  function closeDualBacktestSummary() {{
+    const modal = document.getElementById('dual-backtest-summary-modal');
+    if (modal) modal.classList.remove('show');
+    document.body.style.overflow = '';
+    const url = new URL(window.location.href);
+    url.searchParams.delete('tab');
+    history.replaceState(null, '', url.toString());
+  }}
+
+  function closeDualBacktestSummaryOnBackdrop(event) {{
+    if (event.target.id === 'dual-backtest-summary-modal') closeDualBacktestSummary();
+  }}
+
   document.addEventListener('keydown', (e) => {{
     if (e.key === 'Escape') {{
       closeTradesSummary('BANKNIFTY');
@@ -2111,6 +3046,8 @@ def build_page(selected_date: str = None, selected_slot: str = SLOT_ALL,
       closeDayBreakoutSummary('SENSEX');
       closeDayBreakoutSummary('COMBINATION');
       close3LegSummary();
+      closeDualBacktestSummary();
+      closeStrategyPnlGraph();
       close30MinModal();
     }}
   }});
@@ -2148,11 +3085,168 @@ def build_page(selected_date: str = None, selected_slot: str = SLOT_ALL,
       openDayBreakoutSummary(params.get('instrument') || 'NIFTY');
     }} else if (params.get('tab') === 'threeleg') {{
       open3LegSummary();
+    }} else if (params.get('tab') === 'dual' || params.get('tab') === 'dual-backtest') {{
+      openDualBacktestSummary();
+    }} else if (params.get('tab') === 'strategy-pnl') {{
+      openStrategyPnlGraph();
     }}
   }})();
 </script>
 </body>
 </html>"""
+
+
+def build_dual_mode_comparison(instrument: str = "NIFTY", for_date: str = None) -> tuple:
+    """Build dual-mode comparison table showing REVERSE vs NO-REVERSE side by side."""
+    reverse_records, no_reverse_records = read_dual_mode_trades(instrument, for_date)
+    label = instrument.upper()
+    date_key = for_date or datetime.now(IST).strftime("%Y-%m-%d")
+
+    # Calculate statistics for REVERSE mode
+    reverse_trades = len(reverse_records)
+    reverse_pnl = sum(r["pnl"] for r in reverse_records)
+    reverse_wins = sum(1 for r in reverse_records if r["pnl"] > 0)
+    reverse_losses = sum(1 for r in reverse_records if r["pnl"] < 0)
+
+    # Calculate statistics for NO-REVERSE mode
+    no_reverse_trades = len(no_reverse_records)
+    no_reverse_pnl = sum(r["pnl"] for r in no_reverse_records)
+    no_reverse_wins = sum(1 for r in no_reverse_records if r["pnl"] > 0)
+    no_reverse_losses = sum(1 for r in no_reverse_records if r["pnl"] < 0)
+
+    # Combined statistics
+    total_trades = reverse_trades + no_reverse_trades
+    total_pnl = reverse_pnl + no_reverse_pnl
+
+    reverse_pnl_class = "pnl-positive" if reverse_pnl >= 0 else "pnl-negative"
+    reverse_pnl_formatted = f"+Rs. {reverse_pnl:,.2f}" if reverse_pnl >= 0 else f"-Rs. {abs(reverse_pnl):,.2f}"
+
+    no_reverse_pnl_class = "pnl-positive" if no_reverse_pnl >= 0 else "pnl-negative"
+    no_reverse_pnl_formatted = f"+Rs. {no_reverse_pnl:,.2f}" if no_reverse_pnl >= 0 else f"-Rs. {abs(no_reverse_pnl):,.2f}"
+
+    total_pnl_class = "pnl-positive" if total_pnl >= 0 else "pnl-negative"
+    total_pnl_formatted = f"+Rs. {total_pnl:,.2f}" if total_pnl >= 0 else f"-Rs. {abs(total_pnl):,.2f}"
+
+    if reverse_trades == 0 and no_reverse_trades == 0:
+        empty_html = f"""
+        <div class="summary-bar">
+          <span class="s-item"><span class="s-lbl">Instrument</span><strong>{label} Dual-Mode</strong></span>
+          <span class="s-item"><span class="s-lbl">Date</span><strong>{date_key}</strong></span>
+          <span class="s-item"><span class="s-lbl">Status</span><strong>No Dual-Mode Trades Yet</strong></span>
+        </div>
+        <p class="no-data">No dual-mode trades recorded for {date_key}. Run main_dual.py to generate dual-mode data.</p>
+        """
+        return empty_html, 0, 0.0
+
+    summary = f"""
+    <div class="summary-bar">
+      <span class="s-item"><span class="s-lbl">Instrument</span><strong>{label} Dual-Mode</strong></span>
+      <span class="s-item"><span class="s-lbl">Date</span><strong>{date_key}</strong></span>
+      <span class="s-item"><span class="s-lbl">REVERSE</span><strong style="color:var(--purple);">{reverse_trades} trades | {reverse_pnl_formatted}</strong></span>
+      <span class="s-item"><span class="s-lbl">NO-REVERSE</span><strong style="color:var(--accent);">{no_reverse_trades} trades | {no_reverse_pnl_formatted}</strong></span>
+      <span class="s-item"><span class="s-lbl">COMBINED</span><strong class="{total_pnl_class}" style="font-size:16px;">{total_trades} trades | {total_pnl_formatted}</strong></span>
+    </div>"""
+
+    # Build comparison table
+    table_html = f"""
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th colspan="4" style="text-align:center; background:var(--purple); color:white;">REVERSE MODE (Fade Breakouts)</th>
+            <th colspan="4" style="text-align:center; background:var(--accent); color:white;">NO-REVERSE MODE (Follow Breakouts)</th>
+          </tr>
+          <tr>
+            <th>Trade #</th>
+            <th>Time</th>
+            <th>Direction</th>
+            <th>P&amp;L</th>
+            <th>Trade #</th>
+            <th>Time</th>
+            <th>Direction</th>
+            <th>P&amp;L</th>
+          </tr>
+        </thead>
+        <tbody>"""
+
+    # Determine maximum number of trades across both modes
+    max_trades = max(reverse_trades, no_reverse_trades)
+
+    for i in range(max_trades):
+        # REVERSE mode row
+        if i < reverse_trades:
+            r = reverse_records[i]
+            pnl_val = r["pnl"]
+            pnl_class = "pnl-positive" if pnl_val >= 0 else "pnl-negative"
+            pnl_badge = f"+Rs. {pnl_val:,.2f}" if pnl_val >= 0 else f"-Rs. {abs(pnl_val):,.2f}"
+            time_val = r.get("entry_time", r.get("time", "—"))
+            direction = r.get("direction", "—")
+            table_html += f"""
+        <tr>
+          <td style="background:var(--purple-bg);">{i + 1}</td>
+          <td class="mono" style="background:var(--purple-bg);">{time_val}</td>
+          <td style="background:var(--purple-bg);">{direction}</td>
+          <td class="mono pnl-cell {pnl_class}" style="background:var(--purple-bg);"><strong>{pnl_badge}</strong></td>"""
+        else:
+            table_html += """
+        <tr>
+          <td style="background:var(--purple-bg);">—</td>
+          <td style="background:var(--purple-bg);">—</td>
+          <td style="background:var(--purple-bg);">—</td>
+          <td style="background:var(--purple-bg);">—</td>"""
+
+        # NO-REVERSE mode row
+        if i < no_reverse_trades:
+            r = no_reverse_records[i]
+            pnl_val = r["pnl"]
+            pnl_class = "pnl-positive" if pnl_val >= 0 else "pnl-negative"
+            pnl_badge = f"+Rs. {pnl_val:,.2f}" if pnl_val >= 0 else f"-Rs. {abs(pnl_val):,.2f}"
+            time_val = r.get("entry_time", r.get("time", "—"))
+            direction = r.get("direction", "—")
+            table_html += f"""
+          <td style="background:var(--accent-bg);">{i + 1}</td>
+          <td class="mono" style="background:var(--accent-bg);">{time_val}</td>
+          <td style="background:var(--accent-bg);">{direction}</td>
+          <td class="mono pnl-cell {pnl_class}" style="background:var(--accent-bg);"><strong>{pnl_badge}</strong></td>
+        </tr>"""
+        else:
+            table_html += """
+          <td style="background:var(--accent-bg);">—</td>
+          <td style="background:var(--accent-bg);">—</td>
+          <td style="background:var(--accent-bg);">—</td>
+          <td style="background:var(--accent-bg);">—</td>
+        </tr>"""
+
+    table_html += f"""
+        </tbody>
+        <tfoot>
+          <tr class="tfoot-total">
+            <td colspan="3" style="text-align:right; font-weight:700; font-size:13px; padding:12px 14px; background:var(--purple); color:white;">
+              REVERSE TOTAL ({reverse_trades} trades):
+            </td>
+            <td class="mono pnl-cell {reverse_pnl_class}" style="font-size:15px; font-weight:700; padding:12px 14px; background:var(--purple); color:white;">
+              {reverse_pnl_formatted}
+            </td>
+            <td colspan="3" style="text-align:right; font-weight:700; font-size:13px; padding:12px 14px; background:var(--accent); color:white;">
+              NO-REVERSE TOTAL ({no_reverse_trades} trades):
+            </td>
+            <td class="mono pnl-cell {no_reverse_pnl_class}" style="font-size:15px; font-weight:700; padding:12px 14px; background:var(--accent); color:white;">
+              {no_reverse_pnl_formatted}
+            </td>
+          </tr>
+          <tr class="tfoot-total">
+            <td colspan="7" style="text-align:right; font-weight:700; font-size:14px; padding:12px 14px; background:var(--surface2);">
+              COMBINED TOTAL ({total_trades} trades):
+            </td>
+            <td class="mono pnl-cell {total_pnl_class}" style="font-size:16px; font-weight:700; padding:12px 14px; background:var(--surface2);">
+              {total_pnl_formatted}
+            </td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>"""
+
+    return summary + table_html, total_trades, total_pnl
 
 
 class Handler(BaseHTTPRequestHandler):

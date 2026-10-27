@@ -433,7 +433,8 @@ class TestDayBreakoutThreeConditions(unittest.TestCase):
 
         mock_api = MagicMock()
         # Mock daily realized PnL = 26,000 (exceeds 25,000 limit)
-        with patch("live.daybreakout.executor.get_daily_trade_stats", return_value=(1, 26000.0)):
+        with patch("live.daybreakout.executor.get_daily_trade_stats", return_value=(1, 26000.0)), \
+             patch.dict("live.daybreakout.executor.RISK_CONFIG", {"daily_max_profit": 25000.0}):
             res = execute_daybreakout_spread(dummy_plan, mock_api)
             self.assertEqual(res["status"], "DAILY_MAX_PROFIT_EXCEEDED")
             self.assertIn("Daily maximum profit target reached", res["message"])

@@ -35,7 +35,10 @@ from live.daybreakout.executor import (
     get_daily_profit_stats,
     get_last_stop_loss_time,
     record_triggered_trade,
+    square_off,
     square_off_all,
+    square_off_tracked_trade_eod,
+    close_and_record_tracked_trade,
     has_active_trade,
     get_consecutive_losses,
     check_position_timeout,
@@ -43,6 +46,7 @@ from live.daybreakout.executor import (
     retry_order_with_backoff,
     fetch_manual_exit_price,
     apply_x_factor,
+    _monitoring_state,
 )
 from live.daybreakout.gap_analyzer import (
     GapInfo,
@@ -80,13 +84,14 @@ def _start_eod_watchdog(
     spot_exchange: str = "NSE",
     spot_token: str = None,
     stop_event: Optional[threading.Event] = None,
+    mode: Optional[str] = None,
 ) -> threading.Thread:
     """
     Starts a daemon thread that wakes exactly at `eod_hhmm` (default 15:10)
-    and calls square_off_all() unconditionally.
+    and exits active positions for `inst_name` and `mode`.
 
     - On expiry day, uses expiry_exit_hhmm (14:45) instead of normal EOD time.
-    - Safe to call even if no trade is active (square_off_all handles that).
+    - Safe to call even if no trade is active.
     - If EOD time has already passed, the thread does nothing and returns.
     - Can be cleanly stopped early via stop_event.
     - Daemon=True: auto-killed if the main process exits cleanly.
@@ -112,12 +117,13 @@ def _start_eod_watchdog(
             return
 
         sleep_secs = (target - now).total_seconds()
+        mode_tag = f" ({mode})" if mode else ""
         logger.info(
-            f"[EOD Watchdog] Started. Will force-exit all {inst_name} positions at "
+            f"[EOD Watchdog] Started. Will force-exit {inst_name}{mode_tag} positions at "
             f"{exit_time} (in {sleep_secs:.0f}s)."
         )
         print(
-            f"[EOD Watchdog] Armed — will force square_off_all('{inst_name}') "
+            f"[EOD Watchdog] Armed — will force exit of {inst_name}{mode_tag} positions "
             f"at exactly {exit_time} (in {sleep_secs:.0f}s)"
         )
 
@@ -129,18 +135,32 @@ def _start_eod_watchdog(
         else:
             time.sleep(sleep_secs)
 
-        logger.info(f"[EOD Watchdog] {exit_time} reached — forcing square_off_all('{inst_name}').")
-        print(f"\n[EOD Watchdog] ⏰ {exit_time} — forcing exit of ALL {inst_name} positions.")
+        logger.info(f"[EOD Watchdog] {exit_time} reached — forcing square-off of {inst_name}{mode_tag} positions.")
+        print(f"\n[EOD Watchdog] ⏰ {exit_time} — forcing exit of {inst_name}{mode_tag} positions.")
         try:
-            square_off_all(smart_api, inst_name, is_eod=True)
+            active_trades = _monitoring_state.get_all_trades()
+            matching = [
+                (tid, t) for tid, t in active_trades.items()
+                if str(t.get("symbol_base", "")).upper() == inst_name.upper()
+                and (not mode or str(t.get("mode", "")).upper() == mode.upper())
+            ]
+            if matching:
+                for tid, t in matching:
+                    if not square_off_tracked_trade_eod(smart_api, tid, t, mode=mode):
+                        logger.error(f"[EOD Watchdog] Could not verify square-off for {tid}; leaving it monitored for retry")
+            else:
+                # No in-memory trade may still have an open broker position
+                # (for example after a restart or a missed fill). EOD must
+                # flatten the selected instrument's broker positions too.
+                square_off_all(smart_api, inst_name, is_eod=True, mode=None)
         except Exception as exc:
-            logger.error(f"[EOD Watchdog] Error during square_off_all: {exc}")
-            print(f"[EOD Watchdog] ❌ Error during square_off_all: {exc}")
+            logger.error(f"[EOD Watchdog] Error during square-off: {exc}")
+            print(f"[EOD Watchdog] ❌ Error during square-off: {exc}")
 
     t = threading.Thread(
         target=_watchdog,
         daemon=True,
-        name=f"EOD_Watchdog_{inst_name}",
+        name=f"EOD_Watchdog_{inst_name}_{mode or 'ALL'}",
     )
     t.start()
     return t
@@ -393,6 +413,7 @@ def _build_and_execute(
     trade_type: str = "BREAKOUT",
     structure: str = "spread",
     trade_reason: str = "",
+    mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Builds the option plan, prints it, and executes (or paper-trades)."""
     from live.daybreakout.contract_finder import find_strategy_contracts
@@ -411,18 +432,19 @@ def _build_and_execute(
     opt_label = "CE" if direction == "BULLISH" else "PE"
     struct_label = "Naked " + opt_label if structure.lower() == "naked" else ("Bull Call Spread" if direction == "BULLISH" else "Bear Put Spread")
     trade_tag = f"[{trade_type}]" if trade_type != "BREAKOUT" else ""
+    mode_tag = f" [{mode}]" if mode else ""
 
-    print(f"\n[+] Executing {struct_label} ({structure.upper()}) {trade_tag}:")
+    print(f"\n[+] Executing {struct_label} ({structure.upper()}){mode_tag} {trade_tag}:")
     print(f"    Reason  : {trade_reason}")
     print(f"    BUY Leg : {spread_plan['buy_leg']['symbol']} (Strike: {spread_plan['buy_leg']['strike']} {opt_label})")
     if spread_plan.get("sell_leg"):
         print(f"    SELL Leg: {spread_plan['sell_leg']['symbol']} (Strike: {spread_plan['sell_leg']['strike']} {opt_label})")
     print(f"    Quantity: {spread_plan['quantity']} ({lots} lots)")
-    logger.info(f"Executing {struct_label} ({structure.upper()}) {trade_tag} - Reason: {trade_reason}, Direction: {direction}, Lots: {lots}")
+    logger.info(f"Executing {struct_label} ({structure.upper()}){mode_tag} {trade_tag} - Reason: {trade_reason}, Direction: {direction}, Lots: {lots}")
 
     if paper_trade:
-        print(f"\n[PAPER TRADING] {trade_tag} Confirmed ({structure.upper()}). Skipping live order placement.")
-        logger.info(f"[PAPER TRADING] {trade_tag} Confirmed ({structure.upper()}) - Skipping live order placement")
+        print(f"\n[PAPER TRADING] {trade_tag} Confirmed ({structure.upper()}){mode_tag}. Skipping live order placement.")
+        logger.info(f"[PAPER TRADING] {trade_tag} Confirmed ({structure.upper()}){mode_tag} - Skipping live order placement")
         record_triggered_trade(
             symbol_base=inst["name"],
             structure=structure.upper(),
@@ -431,7 +453,7 @@ def _build_and_execute(
             trade_reason=trade_reason,
             buy_symbol=spread_plan.get("buy_leg", {}).get("symbol", ""),
             sell_symbol=spread_plan.get("sell_leg", {}).get("symbol", "N/A") if spread_plan.get("sell_leg") else "N/A",
-            mode="PAPER"
+            mode=mode or "PAPER"
         )
         return {
             "status": "CONFIRMED_PAPER",
@@ -447,7 +469,7 @@ def _build_and_execute(
         # Apply x-factor from config
         x_factor = RISK_CONFIG.get("x_factor", 1.0)
         logger.info(f"Auto-executing trade via execute_daybreakout_spread - this will handle P&L internally (X-Factor: {x_factor}x)")
-        result = execute_daybreakout_spread(spread_plan, smart_api, trade_reason=trade_reason, x_factor=x_factor)
+        result = execute_daybreakout_spread(spread_plan, smart_api, trade_reason=trade_reason, x_factor=x_factor, mode=mode)
         logger.info(f"execute_daybreakout_spread returned with status: {result.get('status', 'UNKNOWN')}")
         return result
     else:
@@ -468,6 +490,7 @@ _STOP_AFTER_EXECUTE = {
     "DAILY_MAX_PROFIT_EXCEEDED",
     "BUY_ORDER_FAILED",
     "SELL_ORDER_FAILED",
+    "POSITION_RECONCILIATION_FAILED",
     "CONSECUTIVE_LOSS_LIMIT_REACHED",
 }
 
@@ -537,8 +560,13 @@ def _run_15m_close_monitor(
     spot_exchange: str = "NSE",
     spot_token: str = None,
     watchdog_stop_event: Optional[threading.Event] = None,
+    strategy_mode: Optional[str] = None,
+    scaled_risk: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """Wait for completed 15-minute closes and apply the same rules as the backtest."""
+    strategy_mode = (strategy_mode or ("REVERSE" if reverse else "NO-REVERSE")).upper()
+    if scaled_risk is None:
+        scaled_risk = apply_x_factor(RISK_CONFIG.get("x_factor", 1.0))
     spot_symbol = inst["spot_symbol"]
     # Use passed parameters if available, otherwise from inst
     if spot_token is None:
@@ -558,8 +586,8 @@ def _run_15m_close_monitor(
     if vix_delay_active:
         logger.info(f"Loaded {len(vix_delay_active)} persisted VIX delays from previous session")
 
-    # Consecutive loss tracking (load from state)
-    consecutive_losses = get_consecutive_losses(inst["name"])
+    # Consecutive loss tracking (load from state for this specific mode)
+    consecutive_losses = get_consecutive_losses(inst["name"], mode=strategy_mode)
 
     def _load_candles():
         # Wait until 9:15 AM if we're still pre-market (avoids AB1012 API error)
@@ -580,15 +608,23 @@ def _run_15m_close_monitor(
 
     # Prime: update gap territory from already-closed bars, do not enter on them.
     primed = 0
-    for i, candle in enumerate(_load_candles()):
-        if not candle or not is_15m_candle_complete(candle):
-            continue
-        key = str(candle[0])[:16]
-        processed.add(key)
-        primed += 1
-        gap_territory_touched = update_gap_territory(
-            float(candle[4]), range_high, range_low, gap_info, gap_territory_touched
-        )
+    startup_prime_pending = False
+    try:
+        for i, candle in enumerate(_load_candles()):
+            if not candle or not is_15m_candle_complete(candle):
+                continue
+            key = str(candle[0])[:16]
+            processed.add(key)
+            primed += 1
+            gap_territory_touched = update_gap_territory(
+                float(candle[4]), range_high, range_low, gap_info, gap_territory_touched
+            )
+    except Exception as e:
+        # A transient SmartAPI failure during startup must not kill the monitor.
+        # The regular polling loop below will retry and process completed bars.
+        startup_prime_pending = True
+        logger.warning(f"Could not prime 15-min candles at startup; monitoring will retry: {e}")
+        print(f"[!] Could not load startup candles; will retry during monitoring: {e}")
     print(f"[*] 15-min close monitor ready. Primed {primed} completed candle(s) (no late entries on them).")
     if gap_territory_touched:
         print("[*] Gap territory already touched on an earlier bar — recovery is armed.")
@@ -599,7 +635,29 @@ def _run_15m_close_monitor(
     while True:
         try:
             now_dt = datetime.now()
-            candles = _load_candles()
+            try:
+                candles = _load_candles()
+            except Exception as e:
+                # SmartAPI can occasionally return an empty/non-JSON body (for
+                # example during a transient gateway failure). Keep the monitor
+                # alive and retry on the next polling cycle instead of logging
+                # a full traceback for an expected data-fetch failure.
+                logger.warning(f"15-min candle fetch failed; will retry: {e}")
+                time.sleep(5.0)
+                continue
+            if startup_prime_pending:
+                # Initialize from the first successful fetch without entering on
+                # candles that closed before startup recovery completed.
+                for candle in candles or []:
+                    if not candle or not is_15m_candle_complete(candle, now_dt):
+                        continue
+                    processed.add(str(candle[0])[:16])
+                    gap_territory_touched = update_gap_territory(
+                        float(candle[4]), range_high, range_low, gap_info, gap_territory_touched
+                    )
+                startup_prime_pending = False
+                logger.info("15-min candle state initialized after startup fetch recovery")
+                continue
             if not candles:
                 time.sleep(2.0)
                 continue
@@ -656,6 +714,7 @@ def _run_15m_close_monitor(
                     extra_candles_wait=extra_wait,
                     last_entry_hhmm=last_entry,
                     first_entry_hhmm=BREAKOUT_CONFIG.get("first_entry_hhmm", "09:30"),
+                    no_chase_cutoff_hhmm=GAP_CONFIG.get("no_chase_cutoff_hhmm"),
                 )
                 gap_territory_touched = signal.gap_territory_touched
 
@@ -666,62 +725,83 @@ def _run_15m_close_monitor(
                         logger.info(f"Candle {c_time} skipped: {reason_text}")
                     continue
 
-                # ── Single-Trade Gating Check with Timeout ────────────────────
-                if has_active_trade(inst["name"]):
+                # ── Single-Trade Gating Check with Timeout (Mode-Scoped) ────────────────────
+                if has_active_trade(inst["name"], mode=strategy_mode):
                     max_hold_minutes = RISK_CONFIG.get("max_position_hold_minutes", 120)
-                    has_timeout, timeout_trade_id = check_position_timeout(inst["name"], max_hold_minutes)
+                    has_timeout, timeout_trade_id = check_position_timeout(inst["name"], max_minutes=max_hold_minutes, mode=strategy_mode)
                     
                     if has_timeout:
-                        print(f"   [POSITION TIMEOUT] Trade {timeout_trade_id} has exceeded {max_hold_minutes} minutes. Forcing square-off.")
-                        logger.warning(f"Position timeout: Trade {timeout_trade_id} exceeded {max_hold_minutes} minutes. Forcing square-off.")
+                        print(f"   [POSITION TIMEOUT] Trade {timeout_trade_id} ({strategy_mode}) has exceeded {max_hold_minutes} minutes. Forcing specific trade square-off.")
+                        logger.warning(f"Position timeout: Trade {timeout_trade_id} ({strategy_mode}) exceeded {max_hold_minutes} minutes. Forcing specific trade square-off.")
                         try:
-                            square_off_all(smart_api, inst["name"])
-                            # Reset consecutive losses on forced exit (not a loss)
-                            consecutive_losses = 0
+                            timeout_trade = _monitoring_state.get_trade(timeout_trade_id)
+                            if timeout_trade:
+                                if close_and_record_tracked_trade(
+                                    smart_api, timeout_trade_id, timeout_trade,
+                                    exit_reason="EXIT_POSITION_TIMEOUT", mode=strategy_mode,
+                                ):
+                                    # Reset consecutive losses on forced exit (not a loss)
+                                    consecutive_losses = 0
+                            else:
+                                square_off_all(smart_api, inst["name"], mode=strategy_mode)
                         except Exception as e:
-                            logger.error(f"Error during forced square-off: {e}")
-                            print(f"   [!] Error during forced square-off: {e}")
+                            logger.error(f"Error during forced square-off of {timeout_trade_id}: {e}")
+                            print(f"   [!] Error during forced square-off of {timeout_trade_id}: {e}")
                         continue
                     else:
-                        print(f"   [ACTIVE POSITION] An open trade is currently active for {inst['name']}. Waiting for position to exit before triggering new trades.")
-                        logger.info(f"Candle {c_time}: Active trade open for {inst['name']}. Skipping new breakout signal evaluation.")
+                        print(f"   [ACTIVE POSITION] An open trade is currently active for {inst['name']} ({strategy_mode}). Waiting for position to exit before triggering new trades.")
+                        logger.info(f"Candle {c_time}: Active trade open for {inst['name']} ({strategy_mode}). Skipping new breakout signal evaluation.")
                         continue
 
                 if gap_info.be_very_selective:
                     print("    [CAUTION] VERY LARGE GAP DAY — be extremely selective.")
                     logger.warning("VERY LARGE GAP DAY - Being extremely selective")
 
-                daily_trades, daily_loss = get_daily_trade_stats(symbol_base=inst["name"])
-                daily_profit = get_daily_profit_stats(symbol_base=inst["name"])
+                daily_trades, daily_loss = get_daily_trade_stats(symbol_base=inst["name"], mode=strategy_mode)
+                daily_profit = get_daily_profit_stats(symbol_base=inst["name"], mode=strategy_mode)
                 if daily_trades >= RISK_CONFIG["max_daily_trades"]:
-                    print(f"[!] Daily max trades reached ({daily_trades}). Stopping.")
-                    logger.warning(f"Daily max trades reached ({daily_trades}) - Stopping")
+                    print(f"[!] Daily max trades reached for {strategy_mode} ({daily_trades}). Stopping.")
+                    logger.warning(f"Daily max trades reached for {strategy_mode} ({daily_trades}) - Stopping")
                     return {"status": "DAILY_MAX_TRADES_EXCEEDED"}
-                if daily_loss <= RISK_CONFIG["daily_max_loss"]:
-                    print(f"[!] Daily max loss reached (Cumulative Loss: Rs.{daily_loss:.2f}). Stopping.")
-                    logger.warning(f"Daily max loss reached (Cumulative Loss: Rs.{daily_loss:.2f}) - Stopping")
+                if daily_loss <= scaled_risk["daily_max_loss"]:
+                    print(f"[!] Daily max loss reached for {strategy_mode} (Cumulative Loss: Rs.{daily_loss:.2f} <= Rs.{scaled_risk['daily_max_loss']:.2f}). Stopping.")
+                    logger.warning(f"Daily max loss reached for {strategy_mode} (Cumulative Loss: Rs.{daily_loss:.2f}) - Stopping")
                     return {"status": "DAILY_MAX_LOSS_EXCEEDED"}
-                if daily_profit >= RISK_CONFIG.get("daily_max_profit", 25000.0):
-                    print(f"[!] Daily max profit reached (Net P&L: Rs.{daily_profit:.2f} >= Rs.{RISK_CONFIG.get('daily_max_profit', 25000.0):.2f}). Stopping for the day.")
-                    logger.info(f"Daily max profit reached (Net P&L: Rs.{daily_profit:.2f}) - Stopping for the day")
+                if daily_profit >= scaled_risk["daily_max_profit"]:
+                    print(f"[!] Daily max profit reached for {strategy_mode} (Net P&L: Rs.{daily_profit:.2f} >= Rs.{scaled_risk['daily_max_profit']:.2f}). Stopping for the day.")
+                    logger.info(f"Daily max profit reached for {strategy_mode} (Net P&L: Rs.{daily_profit:.2f}) - Stopping for the day")
                     return {"status": "DAILY_MAX_PROFIT_EXCEEDED"}
 
-                # ── Stop-Loss Cooldown Check (wait 45-60 min after SL) ──────
+                # ── Stop-Loss Cooldown Check (wait 45-60 min after SL, mode-scoped) ──────
                 sl_cooldown = RISK_CONFIG.get("sl_cooldown_minutes", 45)
-                last_sl = get_last_stop_loss_time(symbol_base=inst["name"])
+                last_sl = get_last_stop_loss_time(symbol_base=inst["name"], mode=strategy_mode)
                 if last_sl:
                     elapsed_mins = (datetime.now() - last_sl).total_seconds() / 60.0
                     if elapsed_mins < sl_cooldown:
                         remaining_mins = sl_cooldown - elapsed_mins
-                        print(f"   [SL COOLDOWN] Stop-loss occurred at {last_sl.strftime('%H:%M:%S')}. Waiting {remaining_mins:.0f}m more ({sl_cooldown}m cooldown).")
-                        logger.info(f"Candle {c_time} skipped: SL cooldown active ({remaining_mins:.0f}m remaining)")
+                        print(f"   [SL COOLDOWN] Stop-loss occurred for {strategy_mode} at {last_sl.strftime('%H:%M:%S')}. Waiting {remaining_mins:.0f}m more ({sl_cooldown}m cooldown).")
+                        logger.info(f"Candle {c_time} skipped: SL cooldown active for {strategy_mode} ({remaining_mins:.0f}m remaining)")
                         continue
 
-                # ── Consecutive Loss Circuit Breaker ───────────────────────
+                # ── Profit Round Hour Cooldown Check (mode-scoped) ─────────────────────────
+                # If trade exited in profit at a round hour (e.g., 10:00, 11:00), wait 60 minutes
+                profit_round_hour_cooldown = RISK_CONFIG.get("profit_round_hour_cooldown_minutes", 60)
+                last_exit_time, last_exit_reason = _monitoring_state.get_last_exit_time(symbol_base=inst["name"], mode=strategy_mode)
+                if last_exit_time and last_exit_reason in ("EXIT_TRAILING_PROFIT", "EXIT_MAX_PROFIT"):
+                    # Check if exit was at a round hour (minutes = 0)
+                    if last_exit_time.minute == 0:
+                        elapsed_mins = (datetime.now() - last_exit_time).total_seconds() / 60.0
+                        if elapsed_mins < profit_round_hour_cooldown:
+                            remaining_mins = profit_round_hour_cooldown - elapsed_mins
+                            print(f"   [PROFIT ROUND HOUR COOLDOWN] Profit exit for {strategy_mode} at {last_exit_time.strftime('%H:%M')}. Waiting {remaining_mins:.0f}m more ({profit_round_hour_cooldown}m cooldown).")
+                            logger.info(f"Candle {c_time} skipped: Profit round hour cooldown active for {strategy_mode} ({remaining_mins:.0f}m remaining)")
+                            continue
+
+                # ── Consecutive Loss Circuit Breaker (mode-scoped) ───────────────────────
                 max_consecutive_losses = RISK_CONFIG.get("max_consecutive_losses", 3)
                 if consecutive_losses >= max_consecutive_losses:
-                    print(f"[!] CONSECUTIVE LOSS LIMIT REACHED ({consecutive_losses} losses). Stopping for the day.")
-                    logger.warning(f"Consecutive loss limit reached ({consecutive_losses}). Stopping for the day.")
+                    print(f"[!] CONSECUTIVE LOSS LIMIT REACHED for {strategy_mode} ({consecutive_losses} losses). Stopping for the day.")
+                    logger.warning(f"Consecutive loss limit reached for {strategy_mode} ({consecutive_losses}). Stopping for the day.")
                     return {"status": "CONSECUTIVE_LOSS_LIMIT_REACHED"}
 
                 # ── VIX Volatility Filter + Reversal ────────────────────────
@@ -991,6 +1071,7 @@ def _run_15m_close_monitor(
                     inst, c_close, exec_direction, lots, smart_api, paper_trade,
                     auto_execute, gap_info, trade_type=signal.trade_type,
                     structure=structure, trade_reason=trade_reason,
+                    mode=strategy_mode,
                 )
                 if not isinstance(last_result, dict):
                     last_result = {"status": "EXECUTION_ERROR"}
@@ -1001,20 +1082,20 @@ def _run_15m_close_monitor(
                 _print_trade_result(last_result, inst)
                 # ────────────────────────────────────────────────────────────
 
-                # Track consecutive losses synced from shared monitoring state
-                consecutive_losses = get_consecutive_losses(inst["name"])
+                # Track consecutive losses synced from shared monitoring state for this mode
+                consecutive_losses = get_consecutive_losses(inst["name"], mode=strategy_mode)
                 exit_reason = last_result.get("exit_reason", "")
                 pnl = last_result.get("pnl")
                 if pnl is not None:
                     if pnl < 0 or "MAX_LOSS" in exit_reason.upper() or "STOP_LOSS" in exit_reason.upper():
-                        print(f"   [CONSECUTIVE LOSSES] Loss recorded. Total consecutive losses: {consecutive_losses}")
-                        logger.info(f"Consecutive losses: {consecutive_losses}")
+                        print(f"   [CONSECUTIVE LOSSES] Loss recorded for {strategy_mode}. Total consecutive losses: {consecutive_losses}")
+                        logger.info(f"Consecutive losses for {strategy_mode}: {consecutive_losses}")
                     elif pnl > 0:
-                        print(f"   [CONSECUTIVE LOSSES] Profit recorded. Consecutive losses reset to 0.")
-                        logger.info(f"Consecutive losses reset to 0 (profit exit)")
+                        print(f"   [CONSECUTIVE LOSSES] Profit recorded for {strategy_mode}. Consecutive losses reset to 0.")
+                        logger.info(f"Consecutive losses for {strategy_mode} reset to 0 (profit exit)")
 
                 if status == "POSITION_EXISTS":
-                    print(f"   [!] Trade entry skipped because an active position already exists for {inst['name']}.")
+                    print(f"   [!] Trade entry skipped because an active position already exists for {inst['name']} ({strategy_mode}).")
                     continue
 
                 if status in _STOP_AFTER_EXECUTE:
@@ -1039,11 +1120,25 @@ def _run_15m_close_monitor(
             close_dt = now_dt.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
 
             if now_dt >= close_dt:
-                print(f"[*] Market close time reached ({close_time_str}). 15-min close monitor stopping.")
-                logger.info(f"Market close time reached ({close_time_str}) - 15-min close monitor stopping")
+                print(f"[*] Market close time reached ({close_time_str}). 15-min close monitor stopping for {strategy_mode}.")
+                logger.info(f"Market close time reached ({close_time_str}) - 15-min close monitor stopping for {strategy_mode}")
                 if watchdog_stop_event:
                     watchdog_stop_event.set()
-                square_off_all(smart_api, inst["name"], is_eod=True)
+                # Specific token/leg square-off for this mode only
+                active_mode_trades = [
+                    (tid, t) for tid, t in _monitoring_state.get_all_trades().items()
+                    if str(t.get("symbol_base", "")).upper() == inst["name"].upper()
+                    and str(t.get("mode", "")).upper() == strategy_mode.upper()
+                ]
+                if active_mode_trades:
+                    for tid, t in active_mode_trades:
+                        try:
+                            if not square_off_tracked_trade_eod(smart_api, tid, t, mode=strategy_mode):
+                                logger.error(f"EOD square-off failed for {tid}; position remains monitored for retry")
+                        except Exception as sq_err:
+                            logger.error(f"Error squaring off {tid} at session end: {sq_err}")
+                else:
+                    square_off_all(smart_api, inst["name"], is_eod=True, mode=None)
                 if isinstance(last_result, dict):
                     last_result.setdefault("status", "SESSION_END")
                 else:
@@ -1077,7 +1172,7 @@ def _run_15m_close_monitor(
             return {"status": "INTERRUPTED"}
         except Exception as e:
             print(f"[!] Error in 15-min monitor: {e}")
-            logger.error(f"Error in 15-min monitor: {e}")
+            logger.exception("Error in 15-min monitor; traceback follows")
             time.sleep(5.0)
 
 
@@ -1101,6 +1196,7 @@ def run_daybreakout_strategy(
     reverse: bool = True,
     structure: str = "spread",
     confirm_mode: Optional[str] = None,
+    mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Runs the complete Day Breakout workflow:
@@ -1143,10 +1239,13 @@ def run_daybreakout_strategy(
         gap_info = GapInfo()   # Neutral — no restrictions
 
     large_gap_extra_wait = GAP_CONFIG["large_gap_extra_wait_seconds"]
+    no_chase_cutoff = str(GAP_CONFIG.get("no_chase_cutoff_hhmm", "10:30"))
     recovery_enabled     = gap_info.caution_level >= 3   # Only for LARGE / VERY_LARGE
-    mode = (confirm_mode or BREAKOUT_CONFIG.get("confirm_mode") or "15m").lower()
-    if mode not in ("15m", "tick"):
-        mode = "15m"
+    confirm_mode_val     = (confirm_mode or BREAKOUT_CONFIG.get("confirm_mode") or "15m").lower()
+    if confirm_mode_val not in ("15m", "tick"):
+        confirm_mode_val = "15m"
+    strategy_mode        = (mode or ("REVERSE" if reverse else "NO-REVERSE")).upper()
+    scaled_risk = apply_x_factor(RISK_CONFIG.get("x_factor", 1.0))
 
     # ------------------------------------------------------------------
     # Step 1c — Position Recovery (detect and register existing positions)
@@ -1158,11 +1257,12 @@ def run_daybreakout_strategy(
         recovered = _recover_positions(
             smart_api=smart_api,
             symbol_base=inst["name"],
-            check_interval=900.0,  # 15 minutes (900 seconds)
-            max_loss=RISK_CONFIG["max_loss"],
-            max_profit=RISK_CONFIG["max_profit"],
-            profit_threshold=RISK_CONFIG["profit_threshold"],
-            min_profit_step=RISK_CONFIG["min_profit_step"],
+            check_interval=RISK_CONFIG.get("check_interval", 30.0),
+            max_loss=scaled_risk["max_loss"],
+            max_profit=scaled_risk["max_profit"],
+            profit_threshold=scaled_risk["profit_threshold"],
+            min_profit_step=scaled_risk["min_profit_step"],
+            daily_max_loss=scaled_risk["daily_max_loss"],
         )
         if recovered > 0:
             print(f"[+] Successfully recovered {recovered} position(s) for monitoring")
@@ -1184,7 +1284,7 @@ def run_daybreakout_strategy(
     print(f"  [^] Resistance (High)     : {range_high:.2f}")
     print(f"  [v] Support (Low)         : {range_low:.2f}")
     first_entry_cfg = BREAKOUT_CONFIG.get("first_entry_hhmm", "09:30")
-    if mode == "15m":
+    if confirm_mode_val == "15m":
         print(f"  [T] Confirmation          : 15-minute candle CLOSE (matches backtest)")
         print(f"  [T] Entry Window          : {first_entry_cfg} to {BREAKOUT_CONFIG['last_entry_hhmm']}")
     else:
@@ -1196,31 +1296,31 @@ def run_daybreakout_strategy(
         unit_lot_size = get_instrument_lot_size(inst["name"], inst.get("option_exchange"))
         lot_source = "OpenAPIScripMaster.json"
     except Exception as e:
-        unit_lot_size = inst.get("default_lot_size", 65)
-        lot_source = f"fallback ({e})"
+        raise RuntimeError(f"Unable to determine current lot size for {inst['name']} from contract data: {e}") from e
     total_qty = lots * unit_lot_size
 
     print(f"  [#] Option Structure      : {structure.upper()} {'(' + str(inst['spread_width']) + ' pt spread)' if structure.lower() == 'spread' else '(Single Leg Buy)'}")
     print(f"  [Q] Position Sizing       : {lots} lots ({total_qty} Qty | Lot Size: {unit_lot_size} [{lot_source}])")
-    print(f"  [S] Risk Management       : Max Loss Rs.{RISK_CONFIG['max_loss']:.0f} | Trailing Profit Rs.{RISK_CONFIG['profit_threshold']:.0f}")
-    print(f"  [S] Daily Limits          : Max Loss Rs.{RISK_CONFIG['daily_max_loss']:.0f} | Max Profit Rs.{RISK_CONFIG.get('daily_max_profit', 25000.0):.0f} | SL Cooldown {RISK_CONFIG.get('sl_cooldown_minutes', 45)}m")
+    print(f"  [S] Risk Management       : Max Loss Rs.{scaled_risk['max_loss']:.0f} | Trailing Profit Rs.{scaled_risk['profit_threshold']:.0f}")
+    print(f"  [S] Daily Limits          : Max Loss Rs.{scaled_risk['daily_max_loss']:.0f} | Max Profit Rs.{scaled_risk['daily_max_profit']:.0f} | SL Cooldown {RISK_CONFIG.get('sl_cooldown_minutes', 45)}m")
     print(f"  Gap Classification        : {gap_info.label or 'N/A'} (Caution {gap_info.caution_level}/4)")
     if gap_info.no_chase_same_direction:
-        if mode == "15m":
+        if confirm_mode_val == "15m":
             print(f"  No-Chase Rule             : ACTIVE — skip first {extra_15m_candles_wait()} opening 15m candle(s) in gap direction")
         else:
             print(f"  No-Chase Rule             : ACTIVE — extra {large_gap_extra_wait}s wait in gap direction")
     if recovery_enabled:
         print(f"  Recovery Detection        : ACTIVE — monitors for gap reversal signal")
     print(f"  Trade Direction Mode      : {'REVERSE (Fade Breakouts)' if reverse else 'STANDARD (Follow Breakouts)'}")
+    print(f"  Strategy Mode             : {strategy_mode}")
     print(f"  Mode                      : {'PAPER TRADING' if paper_trade else 'LIVE TRADING'}")
     print("=" * 65 + "\n")
     
     # Log strategy initialization
     logger.info(f"DAY BREAKOUT STRATEGY INITIALIZED: {inst['display_name']}")
     logger.info(f"Configuration - Range: {trading_day} (12:30-15:15), High: {range_high:.2f}, Low: {range_low:.2f}")
-    logger.info(f"Settings - Structure: {structure.upper()}, Lots: {lots}, Mode: {mode}, Reverse: {reverse}, Paper: {paper_trade}")
-    logger.info(f"Risk Management - Max Loss: Rs.{RISK_CONFIG['max_loss']:.0f}, Profit Threshold: Rs.{RISK_CONFIG['profit_threshold']:.0f}")
+    logger.info(f"Settings - Structure: {structure.upper()}, Lots: {lots}, Mode: {confirm_mode_val}, Strategy Mode: {strategy_mode}, Reverse: {reverse}, Paper: {paper_trade}")
+    logger.info(f"Risk Management - Max Loss: Rs.{scaled_risk['max_loss']:.0f}, Profit Threshold: Rs.{scaled_risk['profit_threshold']:.0f}")
     logger.info(f"Gap Classification: {gap_info.label or 'N/A'} (Caution {gap_info.caution_level}/4)")
 
     # ------------------------------------------------------------------
@@ -1325,15 +1425,17 @@ def run_daybreakout_strategy(
     _eod_watchdog_thread = _start_eod_watchdog(
         smart_api,
         inst["name"],
+        eod_hhmm=BREAKOUT_CONFIG.get("eod_exit_hhmm", "15:10"),
         trading_day=trading_day,
         instrument_name=inst["name"],
         spot_exchange=spot_exchange,
         spot_token=spot_token,
         stop_event=watchdog_stop_event,
+        mode=strategy_mode,
     )
     logger.info(f"EOD Watchdog thread started: {_eod_watchdog_thread.name}")
 
-    if mode == "15m":
+    if confirm_mode_val == "15m":
         return _run_15m_close_monitor(
             inst=inst,
             range_high=range_high,
@@ -1351,6 +1453,8 @@ def run_daybreakout_strategy(
             spot_exchange=spot_exchange,
             spot_token=spot_token,
             watchdog_stop_event=watchdog_stop_event,
+            strategy_mode=strategy_mode,
+            scaled_risk=scaled_risk,
         )
 
     # ------------------------------------------------------------------
@@ -1382,12 +1486,32 @@ def run_daybreakout_strategy(
     while True:
         try:
             # ── Single-Trade Gating Check for tick mode ──
-            if has_active_trade(inst["name"]):
+            if has_active_trade(inst["name"], mode=strategy_mode):
+                max_hold_minutes = RISK_CONFIG.get("max_position_hold_minutes", 120)
+                has_timeout, timeout_trade_id = check_position_timeout(inst["name"], max_minutes=max_hold_minutes, mode=strategy_mode)
+                if has_timeout:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] [POSITION TIMEOUT] Trade {timeout_trade_id} ({strategy_mode}) exceeded {max_hold_minutes}m. Forcing square-off.")
+                    logger.warning(f"Tick-mode position timeout: Trade {timeout_trade_id} ({strategy_mode}) exceeded {max_hold_minutes} minutes. Forcing square-off.")
+                    try:
+                        timeout_trade = _monitoring_state.get_trade(timeout_trade_id)
+                        if timeout_trade:
+                            close_and_record_tracked_trade(
+                                smart_api, timeout_trade_id, timeout_trade,
+                                exit_reason="EXIT_POSITION_TIMEOUT", mode=strategy_mode,
+                            )
+                        else:
+                            square_off_all(smart_api, inst["name"], mode=strategy_mode)
+                    except Exception as e:
+                        logger.error(f"Error during forced square-off of {timeout_trade_id}: {e}")
+                        print(f"   [!] Error during forced square-off of {timeout_trade_id}: {e}")
+                    time.sleep(poll_interval)
+                    continue
+
                 now_check = time.time()
                 now_check_str = datetime.now().strftime("%H:%M:%S")
                 if int(now_check) % 30 == 0 and int(now_check) != last_print_sec:
                     last_print_sec = int(now_check)
-                    print(f"[{now_check_str}] [ACTIVE POSITION] Position currently open for {inst['name']}. Tick monitor waiting for trade exit...")
+                    print(f"[{now_check_str}] [ACTIVE POSITION] Position currently open for {inst['name']} ({strategy_mode}). Tick monitor waiting for trade exit...")
                 time.sleep(poll_interval)
                 continue
 
@@ -1408,27 +1532,27 @@ def run_daybreakout_strategy(
                 time.sleep(poll_interval)
                 continue
 
-            daily_trades, daily_loss = get_daily_trade_stats(symbol_base=inst["name"])
-            daily_profit = get_daily_profit_stats(symbol_base=inst["name"])
+            daily_trades, daily_loss = get_daily_trade_stats(symbol_base=inst["name"], mode=strategy_mode)
+            daily_profit = get_daily_profit_stats(symbol_base=inst["name"], mode=strategy_mode)
             if daily_trades >= RISK_CONFIG["max_daily_trades"]:
-                print(f"[!] Daily max trades reached ({daily_trades}). Stopping.")
+                print(f"[!] Daily max trades reached ({daily_trades}) for {inst['name']} ({strategy_mode}). Stopping.")
                 return {"status": "DAILY_MAX_TRADES_EXCEEDED"}
-            if daily_loss <= RISK_CONFIG["daily_max_loss"]:
-                print(f"[!] Daily max loss reached (Cumulative Loss: Rs.{daily_loss:.2f}). Stopping.")
+            if daily_loss <= scaled_risk["daily_max_loss"]:
+                print(f"[!] Daily max loss reached (Cumulative Loss: Rs.{daily_loss:.2f} <= Rs.{scaled_risk['daily_max_loss']:.2f}) for {inst['name']} ({strategy_mode}). Stopping.")
                 return {"status": "DAILY_MAX_LOSS_EXCEEDED"}
-            if daily_profit >= RISK_CONFIG.get("daily_max_profit", 25000.0):
-                print(f"[!] Daily max profit reached (Net P&L: Rs.{daily_profit:.2f} >= Rs.{RISK_CONFIG.get('daily_max_profit', 25000.0):.2f}). Stopping for the day.")
+            if daily_profit >= scaled_risk["daily_max_profit"]:
+                print(f"[!] Daily max profit reached (Net P&L: Rs.{daily_profit:.2f} >= Rs.{scaled_risk['daily_max_profit']:.2f}) for {inst['name']} ({strategy_mode}). Stopping for the day.")
                 return {"status": "DAILY_MAX_PROFIT_EXCEEDED"}
 
             sl_cooldown_min = RISK_CONFIG.get("sl_cooldown_minutes", 45)
-            last_sl = get_last_stop_loss_time(symbol_base=inst["name"])
+            last_sl = get_last_stop_loss_time(symbol_base=inst["name"], mode=strategy_mode)
             if last_sl:
                 elapsed_mins = (datetime.now() - last_sl).total_seconds() / 60.0
                 if elapsed_mins < sl_cooldown_min:
                     if int(now) % 60 == 0 and int(now) != last_print_sec:
                         last_print_sec = int(now)
                         remaining = sl_cooldown_min - elapsed_mins
-                        print(f"[{now_str}] [SL COOLDOWN] Stop-loss at {last_sl.strftime('%H:%M:%S')}. Waiting {remaining:.0f}m more ({sl_cooldown_min}m cooldown)...")
+                        print(f"[{now_str}] [SL COOLDOWN] Stop-loss ({strategy_mode}) at {last_sl.strftime('%H:%M:%S')}. Waiting {remaining:.0f}m more ({sl_cooldown_min}m cooldown)...")
                     time.sleep(poll_interval)
                     continue
 
@@ -1473,7 +1597,11 @@ def run_daybreakout_strategy(
 
                 elapsed = now - high_breakout_start
                 same_dir = _is_same_as_gap_direction("BULLISH", gap_info)
-                if gap_info.no_chase_same_direction and same_dir:
+                if gap_info.no_chase_same_direction and same_dir and now_str[:5] >= no_chase_cutoff:
+                    if not no_chase_announced_high:
+                        no_chase_announced_high = True
+                        print(f"[{now_str}] [NO-CHASE SKIPPED] Past {no_chase_cutoff} — late start, using standard {confirmation_seconds}s confirmation (no extra wait).")
+                if gap_info.no_chase_same_direction and same_dir and now_str[:5] < no_chase_cutoff:
                     effective_wait = confirmation_seconds + large_gap_extra_wait
                     if not no_chase_announced_high:
                         no_chase_announced_high = True
@@ -1497,7 +1625,7 @@ def run_daybreakout_strategy(
                     logger.info(f"[CONFIRMED] BULLISH BREAKOUT - Spot: {spot_ltp:.1f} > High: {range_high:.1f}, Exec Direction: {exec_direction}")
                     last_result = _build_and_execute(
                         inst, spot_ltp, exec_direction, lots, smart_api, paper_trade, auto_execute, gap_info,
-                        trade_type="BREAKOUT", structure=structure, trade_reason=t_reason
+                        trade_type="BREAKOUT", structure=structure, trade_reason=t_reason, mode=strategy_mode
                     )
                     _print_trade_result(last_result, inst)
                     status = (last_result or {}).get("status", "")
@@ -1545,7 +1673,11 @@ def run_daybreakout_strategy(
 
                 elapsed = now - low_breakout_start
                 same_dir = _is_same_as_gap_direction("BEARISH", gap_info)
-                if gap_info.no_chase_same_direction and same_dir:
+                if gap_info.no_chase_same_direction and same_dir and now_str[:5] >= no_chase_cutoff:
+                    if not no_chase_announced_low:
+                        no_chase_announced_low = True
+                        print(f"[{now_str}] [NO-CHASE SKIPPED] Past {no_chase_cutoff} — late start, using standard {confirmation_seconds}s confirmation (no extra wait).")
+                if gap_info.no_chase_same_direction and same_dir and now_str[:5] < no_chase_cutoff:
                     effective_wait = confirmation_seconds + large_gap_extra_wait
                     if not no_chase_announced_low:
                         no_chase_announced_low = True
@@ -1569,7 +1701,7 @@ def run_daybreakout_strategy(
                     logger.info(f"[CONFIRMED] BEARISH BREAKOUT - Spot: {spot_ltp:.1f} < Low: {range_low:.1f}, Exec Direction: {exec_direction}")
                     last_result = _build_and_execute(
                         inst, spot_ltp, exec_direction, lots, smart_api, paper_trade, auto_execute, gap_info,
-                        trade_type="BREAKOUT", structure=structure, trade_reason=t_reason
+                        trade_type="BREAKOUT", structure=structure, trade_reason=t_reason, mode=strategy_mode
                     )
                     _print_trade_result(last_result, inst)
                     status = (last_result or {}).get("status", "")
@@ -1636,7 +1768,7 @@ def run_daybreakout_strategy(
                     last_result = _build_and_execute(
                         inst, spot_ltp, exec_direction, lots,
                         smart_api, paper_trade, auto_execute, gap_info,
-                        trade_type="RECOVERY", structure=structure, trade_reason=t_reason
+                        trade_type="RECOVERY", structure=structure, trade_reason=t_reason, mode=strategy_mode
                     )
                     _print_trade_result(last_result, inst)
                     status = (last_result or {}).get("status", "")
@@ -1678,11 +1810,25 @@ def run_daybreakout_strategy(
             close_time_with_seconds = close_time + ":00"
             
             if now_str >= close_time_with_seconds:
-                print(f"[*] Market close time reached ({close_time}). Tick-mode monitor stopping.")
-                logger.info(f"Market close time reached ({close_time}) - Tick-mode monitor stopping")
+                print(f"[*] Market close time reached ({close_time}). Tick-mode monitor stopping for {strategy_mode}.")
+                logger.info(f"Market close time reached ({close_time}) - Tick-mode monitor stopping for {strategy_mode}")
                 if watchdog_stop_event:
                     watchdog_stop_event.set()
-                square_off_all(smart_api, inst["name"], is_eod=True)
+                # Specific token/leg square-off for this mode only
+                active_mode_trades = [
+                    (tid, t) for tid, t in _monitoring_state.get_all_trades().items()
+                    if str(t.get("symbol_base", "")).upper() == inst["name"].upper()
+                    and str(t.get("mode", "")).upper() == strategy_mode.upper()
+                ]
+                if active_mode_trades:
+                    for tid, t in active_mode_trades:
+                        try:
+                            if not square_off_tracked_trade_eod(smart_api, tid, t, mode=strategy_mode):
+                                logger.error(f"EOD square-off failed for {tid}; position remains monitored for retry")
+                        except Exception as sq_err:
+                            logger.error(f"Error squaring off {tid} at session end: {sq_err}")
+                else:
+                    square_off_all(smart_api, inst["name"], is_eod=True, mode=None)
                 return {"status": "SESSION_END"}
 
             time.sleep(poll_interval)

@@ -103,8 +103,8 @@ def prompt_instrument_selection() -> Tuple[str, bool]:
     print("\n" + "=" * 55)
     print("       DAY BREAKOUT STRATEGY - INSTRUMENT SELECTION")
     print("=" * 55)
-    print("1. NIFTY       (Spread width: 300 pts | Step: 50 | Lot: 65)")
-    print("2. SENSEX      (Spread width: 1,000 pts | Step: 100 | Lot: 20)")
+    print("1. NIFTY       (Spread width: 300 pts | Step: 50 | Lot size: fetched from current contract)")
+    print("2. SENSEX      (Spread width: 1,000 pts | Step: 100 | Lot size: fetched from current contract)")
     print("3. COMBINATION (Auto-pick Nearest Expiry Instrument)")
     print("=" * 55)
 
@@ -293,7 +293,7 @@ def main():
         range_high=range_high,
         range_low=range_low,
         trading_day=trading_day,
-        lots=8, #args.lots,
+        lots=args.lots,
         confirmation_seconds=args.confirmation,
         smart_api=smart_api,
         paper_trade=args.paper,

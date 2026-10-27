@@ -23,7 +23,6 @@ INSTRUMENTS = {
         "option_exchange": "NFO",
         "strike_step": 50,
         "spread_width": 300,        # 300-point Bull Call / Bear Put Spread
-        "default_lot_size": 65,
         "csv_prefix": "NIFTY",
     },
     "SENSEX": {
@@ -35,7 +34,6 @@ INSTRUMENTS = {
         "option_exchange": "BFO",
         "strike_step": 100,
         "spread_width": 1000,       # 1,000-point Bull Call / Bear Put Spread
-        "default_lot_size": 25,
         "csv_prefix": "SENSEX",
     }
 }
@@ -58,6 +56,8 @@ BREAKOUT_CONFIG = {
     "candle_close_buffer_seconds": 5,  # Wait after the 15m boundary before fetching the close
     "eod_exit_hhmm": "15:10",       # Normal EOD exit time
     "expiry_exit_hhmm": "14:45",    # EOD exit time on expiry day
+    "market_open_hhmm": "09:15",    # Exchange session start (orders placed outside it cannot fill)
+    "market_close_hhmm": "15:30",   # Exchange session end
 }
 
 # Risk Management Settings (Matching broken_call.py)
@@ -71,17 +71,16 @@ RISK_CONFIG = {
     "daily_max_profit": 35000.0,    # Daily profit > Rs.25K -> no more trades of that day
     "sl_cooldown_minutes": 45,      # Wait at least 45-60 min after a stop-loss before another entry
     "max_daily_trades": 4,
-    "check_interval": 900.0,  # 15 minutes interval
+    "check_interval": 900.0,   # Check live P&L and threshold exits every 900 seconds; candle signals remain 15-minute.
     # Consecutive loss circuit breaker
     "max_consecutive_losses": 3,    # Stop if 3 consecutive stop-losses occur
     "consecutive_loss_cooldown_minutes": 60,  # Wait time after consecutive losses
     # Maximum position holding time (to prevent stuck positions)
     "max_position_hold_minutes": 120,  # Force square-off after 2 hours
     # Fixed monetary loss stop loss (broker-side STOPLOSS_LIMIT order placed at trade entry)
-    # Trigger price = entry_price - (fixed_loss_amount / quantity)
-    # Example: entry=200, lots=10 (qty=200), fixed_loss=9000 → trigger = 200 - 45 = 155
+    # Trigger price = entry_price - (fixed_loss_amount / quantity), rounded up to a valid 0.05 tick.
     "enable_fixed_loss_sl": True,      # Broker-side fixed monetary loss SL
-    "fixed_loss_amount": 9000.0,       # Fixed loss cap per trade in Rs.
+    "fixed_loss_amount": 10400.0,      # Broker-side fixed loss threshold per trade in Rs.
     # Exit-type specific cooldowns (in minutes)
     "exit_cooldown_minutes": {
         "EXIT_MAX_LOSS": 0,              # Stop loss - longer cooldown to avoid revenge trading
@@ -92,6 +91,9 @@ RISK_CONFIG = {
         "MANUAL_EXIT": 5,                 # Manual exit - short cooldown to check status
         "EXIT_EOD_SQUARE_OFF": 9999,      # EOD square off - no re-entry
     },
+    # Profit exit at round hour cooldown (in minutes)
+    # If a trade exits in profit at a round hour (e.g., 10:00, 11:00), wait this many minutes before next entry
+    "profit_round_hour_cooldown_minutes": 60,
     # Order execution settings
     "enable_order_retry": True,        # Enable retry logic for rejected orders
     "order_retry_max_attempts": 3,     # Maximum retry attempts for rejected orders
@@ -99,6 +101,8 @@ RISK_CONFIG = {
     "enable_order_polling": True,      # Enable order status polling
     "order_poll_interval": 15.0,       # Poll interval in seconds (15-20s)
     "order_poll_max_time": 120.0,      # Maximum polling time in seconds (2 minutes)
+    "cancel_confirm_timeout": 30.0,    # Seconds to wait for the order book to confirm a cancellation
+    "max_eod_close_attempts": 5,       # Automatic EOD close tries per trade before manual intervention
     "enable_manual_exit_price_fetch": True,  # Enable historical price fetch for manual exits
 }
 
@@ -123,6 +127,11 @@ GAP_CONFIG = {
     # standard confirmation_seconds, applied when price moves in the same
     # direction as the gap (no-chase rule).
     "large_gap_extra_wait_seconds": 300,   # additional 5 minutes
+
+    # No-chase cutoff: once the clock is at/after this HH:MM, skip the extra
+    # no-chase wait and confirm breakouts with the standard confirmation_seconds
+    # only. Prevents a late program start from re-imposing the opening wait.
+    "no_chase_cutoff_hhmm": "10:30",
 }
 
 # India VIX Configuration for Breakout Filter
@@ -138,4 +147,4 @@ VIX_CONFIG = {
     "vix_delay_minutes": 15,        # Initial delay duration in minutes when VIX conditions are met
     "vix_max_stall_minutes": 30,    # Absolute maximum stall time (cap on total delay + extensions)
     "vix_candle_check_count": 3,    # Number of recent 15-min candles to check for low breakdown
-}                       
+}
